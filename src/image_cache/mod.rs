@@ -1,11 +1,11 @@
 use std::{
 	borrow::Cow,
-	collections::BTreeMap,
-	ffi::{OsStr, OsString},
-	fs, mem,
+	collections::{BTreeMap, HashSet},
+	ffi::OsString,
+	fs,
 	path::{Path, PathBuf},
 	rc::Rc,
-	sync::atomic::Ordering,
+	sync::LazyLock,
 	time::SystemTime,
 };
 
@@ -13,16 +13,18 @@ use log::trace;
 
 use gelatin::{
 	glium::{
-		self,
+		self, CapabilitiesSource,
 		texture::{MipmapsOption, RawImage2d, SrgbTexture2d},
-		CapabilitiesSource,
 	},
 	image,
 };
 
 pub mod image_loader;
 
-use self::{directory::DirItem, image_loader::*};
+use self::{
+	directory::{DirItem, ListingChange},
+	image_loader::*,
+};
 
 mod pending_requests;
 use pending_requests::PendingRequests;
@@ -30,10 +32,16 @@ use pending_requests::PendingRequests;
 pub mod directory;
 use directory::Directory;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Debug, thiserror::Error)]
 pub enum TextureError {
 	#[error("ImageCache is waiting for the image loader to send result")]
 	WaitingOnLoader,
+
+	#[error("ImageCache is waiting for the folder listing")]
+	WaitingOnListing,
 
 	#[error("Other texture error: {0}")]
 	Other(Cow<'static, str>),
@@ -61,14 +69,16 @@ impl TextureError {
 
 pub type TextureResult<T> = std::result::Result<T, TextureError>;
 
-// use self::texture_load_errors::*;
-
 #[derive(Debug, thiserror::Error)]
 pub enum PathResolutionError {
-	#[error("No image path has been specified. (Eg emulsion was started without it being requested to open an image or folder)")]
+	#[error(
+		"No image path has been specified. (Eg emulsion was started without it being requested to open an image or folder)"
+	)]
 	NotYetSpecified,
 
-	#[error("Could not find file path matching the request, because the Directory Filter hasn't finished yet")]
+	#[error(
+		"Could not find file path matching the request, because the Directory Filter hasn't finished yet"
+	)]
 	WaitingOnDirFilter,
 }
 
@@ -78,16 +88,58 @@ pub enum PathResolutionError {
 pub type PathedTextureResult =
 	std::result::Result<(PathBuf, TextureResult<AnimationFrameTexture>), PathResolutionError>;
 
+/// Estimate for images whose header can't be read (eg SVGs, which are rendered up to 4096 px).
+const UNKNOWN_SIZE_ESTIMATE: isize = 16 * 1024 * 1024;
+
 pub fn get_image_size_estimate(width: u32, height: u32) -> isize {
 	// In an RGBA image, each pixel is 4 bytes.
 	// counting all the mipmaps would add an additionnal multiplier of around ~1.6
 	// but only the gpu textures have mip maps so just multiply by 1.5
 	// 4 x 1.5 gives the factor 6.
-	(width * height * 6) as isize
+	isize::try_from(width as u64 * height as u64 * 6).unwrap_or(isize::MAX)
 }
 
 pub fn get_anim_size_estimate(frames: &[AnimationFrameTexture]) -> isize {
-	frames.iter().map(|frame| get_image_size_estimate(frame.w, frame.h)).sum()
+	frames.iter().fold(0, |total: isize, frame| {
+		total.saturating_add(get_image_size_estimate(frame.w, frame.h))
+	})
+}
+
+/// Size a request is expected to need, read from the image header without decoding it.
+fn estimate_file_size(path: &Path) -> isize {
+	image::ImageReader::open(path)
+		.and_then(|reader| reader.with_guessed_format())
+		.ok()
+		.and_then(|reader| reader.into_dimensions().ok())
+		.map_or(UNKNOWN_SIZE_ESTIMATE, |(width, height)| get_image_size_estimate(width, height))
+}
+
+/// Picks which cache entries to keep from `(req_id, distance from the current image, size)`:
+/// nearest first while they fit in `capacity`. The current image (distance 0) is always kept.
+fn select_cache_entries(mut entries: Vec<(u32, usize, isize)>, capacity: isize) -> Vec<u32> {
+	entries.sort_by_key(|&(_, distance, _)| distance);
+	let mut remaining = capacity;
+	entries
+		.into_iter()
+		.filter_map(|(req_id, distance, size)| {
+			if distance == 0 || remaining > size.saturating_add(UNKNOWN_SIZE_ESTIMATE) {
+				remaining = remaining.saturating_sub(size);
+				Some(req_id)
+			} else {
+				None
+			}
+		})
+		.collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SendOutcome {
+	/// A request went out to the loader.
+	Sent,
+	/// Nothing to do for this file: it is cached, already requested or unchanged.
+	Skipped,
+	/// No more requests can be sent for now: too many are pending or the budget is used up.
+	Blocked,
 }
 
 /// The request sender function must process all prefetched requests to avoid
@@ -136,6 +188,11 @@ pub struct AnimationFrameTexture {
 	/// The total height of the image. This equals to the sum of the heights of the
 	/// textures from a single column of the grid
 	pub h: u32,
+
+	/// The gamut the texels are encoded in. The shader converts it to the window's.
+	pub primaries: Primaries,
+	/// Rendered from an SVG, at a size that can be made sharper by rendering it again.
+	pub svg: bool,
 }
 impl AnimationFrameTexture {
 	pub fn from_image(
@@ -143,6 +200,8 @@ impl AnimationFrameTexture {
 		image: image::RgbaImage,
 		delay_nano: u64,
 		orientation: Orientation,
+		primaries: Primaries,
+		svg: bool,
 	) -> TextureResult<Self> {
 		let (w, h) = image.dimensions();
 		let img_bytes = image.into_raw();
@@ -154,9 +213,6 @@ impl AnimationFrameTexture {
 		// I believe that if the memory is fragmented, it is easier to find
 		// space for a smaller texture)
 		let max_size = (display.get_capabilities().max_texture_size as u32 / 2).min(4 * 1024);
-
-		// DEBUG
-		// let max_size = 1024;
 
 		let grid_cols = ((w - 1) / max_size) + 1;
 		let grid_rows = ((h - 1) / max_size) + 1;
@@ -179,6 +235,8 @@ impl AnimationFrameTexture {
 			tex_grid: Rc::new(tex_grid),
 			delay_nano,
 			orientation,
+			primaries,
+			svg,
 			w,
 			h,
 			cell_step_size: max_size,
@@ -194,6 +252,77 @@ impl AnimationFrameTexture {
 	}
 }
 
+/// Whether any texel of the rgba8 buffer is not fully opaque; stops at the first one.
+fn has_transparency(rgba: &[u8]) -> bool {
+	rgba.as_chunks::<4>().0.iter().any(|texel| texel[3] != 255)
+}
+
+const LINEAR_STEPS: usize = 4096;
+
+static SRGB_TO_LINEAR: LazyLock<[f32; 256]> = LazyLock::new(|| {
+	std::array::from_fn(|i| {
+		let c = i as f32 / 255.0;
+		if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+	})
+});
+
+static LINEAR_TO_SRGB: LazyLock<[u8; LINEAR_STEPS]> = LazyLock::new(|| {
+	std::array::from_fn(|i| {
+		let l = i as f32 / (LINEAR_STEPS - 1) as f32;
+		let c = if l <= 0.003_130_8 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 };
+		(c * 255.0 + 0.5) as u8
+	})
+});
+
+/// Premultiplies an rgba8 buffer holding sRGB-encoded color. The GPU filters sRGB textures in
+/// linear light, so the multiplication has to happen in linear light too for the fragment
+/// shader's `rgb / a` to recover the original color. Opaque texels are left untouched.
+fn premultiply_srgb(rgba: &mut [u8]) {
+	let decode = &*SRGB_TO_LINEAR;
+	let encode = &*LINEAR_TO_SRGB;
+	for texel in rgba.as_chunks_mut::<4>().0 {
+		if texel[3] == 255 {
+			continue;
+		}
+		let alpha = texel[3] as f32 / 255.0;
+		for channel in &mut texel[..3] {
+			let linear = decode[*channel as usize] * alpha;
+			*channel = encode[(linear * (LINEAR_STEPS - 1) as f32 + 0.5) as usize];
+		}
+	}
+}
+
+#[cfg(test)]
+mod premultiply_tests {
+	use super::*;
+
+	#[test]
+	fn opaque_buffers_are_not_transparent_and_stay_untouched() {
+		let mut opaque = vec![10, 20, 30, 255, 200, 100, 0, 255];
+		assert!(!has_transparency(&opaque));
+		premultiply_srgb(&mut opaque);
+		assert_eq!(opaque, [10, 20, 30, 255, 200, 100, 0, 255]);
+	}
+
+	#[test]
+	fn one_translucent_texel_is_detected() {
+		assert!(has_transparency(&[1, 2, 3, 255, 1, 2, 3, 254]));
+	}
+
+	#[test]
+	fn premultiplying_scales_in_linear_light() {
+		let mut texels = vec![255, 255, 255, 0, 255, 255, 255, 128, 40, 50, 60, 255];
+		premultiply_srgb(&mut texels);
+		// Fully transparent texels lose their color.
+		assert_eq!(texels[..4], [0, 0, 0, 0]);
+		// White at 50% alpha is 0.5 in linear light, which is ~188 in sRGB.
+		assert!((i32::from(texels[4]) - 188).abs() <= 2, "{}", texels[4]);
+		assert_eq!(texels[4], texels[5]);
+		assert_eq!(texels[7], 128);
+		assert_eq!(texels[8..], [40, 50, 60, 255]);
+	}
+}
+
 /// img_bytes has to be an rgba8 buffer.
 #[allow(clippy::too_many_arguments)]
 fn texture_from_img_rect(
@@ -206,17 +335,17 @@ fn texture_from_img_rect(
 	cell_w: u32,
 	cell_h: u32,
 ) -> TextureResult<SrgbTexture2d> {
-	let raw_image;
-	if img_w == cell_w {
+	debug_assert!(offset_x + cell_w <= img_w && offset_y + cell_h <= img_h);
+	let mut raw_image = if img_w == cell_w {
 		assert!(offset_x == 0);
 		let start = (offset_y as usize * img_w as usize) * 4;
 		let end = start + (cell_h as usize * cell_w as usize * 4);
-		raw_image = RawImage2d {
+		RawImage2d {
 			data: Cow::Borrowed(&img_bytes[start..end]),
 			format: glium::texture::ClientFormat::U8U8U8U8,
 			width: cell_w,
 			height: cell_h,
-		};
+		}
 	} else {
 		let cell_size = cell_w as usize * cell_h as usize * 4;
 		let mut cell_pixels = Vec::with_capacity(cell_size);
@@ -227,19 +356,20 @@ fn texture_from_img_rect(
 			let end = start + (cell_w as usize * 4);
 			cell_pixels.extend_from_slice(&img_bytes[start..end]);
 		}
-		raw_image = RawImage2d::from_raw_rgba(cell_pixels, (cell_w, cell_h));
+		RawImage2d::from_raw_rgba(cell_pixels, (cell_w, cell_h))
+	};
+
+	// Straight alpha can't be filtered: transparent texels' RGB would bleed into the edges of
+	// every mip level. Opaque images (the common case) only pay for the scan.
+	if has_transparency(&raw_image.data) {
+		premultiply_srgb(raw_image.data.to_mut());
 	}
 
-	let x_pow = 31 - img_w.leading_zeros();
-	let y_pow = 31 - img_h.leading_zeros();
-
-	let max_mipmap_levels = x_pow.min(y_pow).min(4);
-
-	let mipmaps = if max_mipmap_levels == 1 {
+	// A full chain, so far zoomed-out huge images are properly filtered.
+	let mipmaps = if cell_w.min(cell_h) < 2 {
 		MipmapsOption::NoMipmap
 	} else {
-		MipmapsOption::AutoGeneratedMipmapsMax(max_mipmap_levels)
-		//MipmapsOption::AutoGeneratedMipmaps
+		MipmapsOption::AutoGeneratedMipmaps
 	};
 	Ok(SrgbTexture2d::with_mipmaps(display, raw_image, mipmaps)?)
 }
@@ -257,9 +387,18 @@ struct CachedTexture {
 	/// If it's not fully loaded yet a `WaitingOnLoader` error is returned.
 	fully_loaded: bool,
 
+	/// Only the first frame of an animation was loaded (by a prefetch); the rest has to be
+	/// loaded once the image is shown. Such an image is not a finished still.
+	truncated: bool,
+
 	/// - `false` if loading is still in progress or if succeeded.
 	/// - `true` if this failed to load,
 	failed: bool,
+
+	/// An SVG is being rendered again (sharper): `frames` still holds the old render, which the
+	/// new one replaces when it arrives. Until then the image is not handed out again, so the
+	/// callers keep showing the old one.
+	replacing: bool,
 
 	/// If the target file is an image this vector will have a single texture once the
 	/// image uploaded to the GPU. If the target file is an animated image like a gif,
@@ -283,17 +422,15 @@ struct CachedTexture {
 pub struct ImageCache {
 	dir: Directory,
 
-	//current_name: OsString,
-	//current_file_idx: usize,
 	current_frame_idx: usize,
 
-	remaining_capacity: isize,
 	total_capacity: isize,
-	curr_est_size: isize,
 
 	pending_requests: PendingRequests,
 	texture_cache: BTreeMap<u32, CachedTexture>,
 	loader: ImageLoader,
+	/// The box SVG requests are rendered to fit, see `set_svg_view`.
+	svg_view: (u32, u32),
 }
 
 /// This is a store for the supported images loaded from a folder
@@ -307,17 +444,68 @@ impl ImageCache {
 	pub fn new(capacity: isize, threads: u32) -> ImageCache {
 		ImageCache {
 			dir: Directory::new(),
-			//current_file_idx: 0,
 			current_frame_idx: 0,
 
-			remaining_capacity: capacity,
 			total_capacity: capacity,
-			curr_est_size: 1000, // 1 kb, an optimistic estimate for the image size before anything is loaded
 
 			pending_requests: PendingRequests::new(),
 			texture_cache: BTreeMap::new(),
 			loader: ImageLoader::new(threads),
+			svg_view: SVG_DEFAULT_FIT,
 		}
+	}
+
+	/// Sets the box, in physical pixels, that SVGs loaded from now on are rendered to fit: the
+	/// part of the window the picture is shown in, at most `SVG_INITIAL_MAX_SIDE` on a side.
+	/// Zooming in is answered with sharper renders (see `rerender_svg`).
+	pub fn set_svg_view(&mut self, width: u32, height: u32) {
+		let clamp = |side: u32| side.clamp(1, SVG_INITIAL_MAX_SIDE);
+		self.svg_view = (clamp(width), clamp(height));
+	}
+
+	/// Renders the SVG that is shown again, to fit `fit` (physical pixels). The texture shown
+	/// so far stays in use until the new one is uploaded: `try_getting_requested_image` answers
+	/// `WaitingOnLoader` meanwhile, so the caller has to ask for the current image again.
+	/// Returns `false` when that can't be done now (the image is not a loaded SVG, the loader
+	/// is busy or has results of this file left): try again later.
+	pub fn rerender_svg(&mut self, fit: (u32, u32)) -> bool {
+		let Some(DirItem { path, request_id }) = self.curr_dir_item() else {
+			return false;
+		};
+		if self.pending_requests.len() >= Self::MAX_PENDING_REQUESTS
+			|| self.pending_requests.get_all_ids().contains(&request_id)
+		{
+			return false;
+		}
+		let Some(texture) = self.texture_cache.get_mut(&request_id) else {
+			return false;
+		};
+		if !texture.fully_loaded || texture.failed {
+			return false;
+		}
+		let Some(frame) = texture.frames.first().filter(|frame| frame.svg) else {
+			return false;
+		};
+		let (width, height) = svg_render_size(frame.w as f32, frame.h as f32, fit);
+		let reserved = get_image_size_estimate(width, height);
+		texture.replacing = true;
+		let mut request = LoadRequest::new(request_id, path, false);
+		request.svg_fit = fit;
+		self.pending_requests.add_request(&request, reserved);
+		self.loader.set_priority(request_id);
+		self.loader.send_load_request(request);
+		true
+	}
+
+	/// Capacity not used by cached textures or reserved by requests that are still loading.
+	fn remaining_capacity(&self) -> isize {
+		let cached = self.texture_cache.values().fold(0isize, |total, texture| {
+			total.saturating_add(get_anim_size_estimate(&texture.frames))
+		});
+		self.total_capacity
+			.saturating_sub(cached)
+			.saturating_sub(self.pending_requests.reserved_total())
+			.max(0)
 	}
 
 	pub fn current_filename(&self) -> Option<OsString> {
@@ -328,13 +516,15 @@ impl ImageCache {
 		self.current_filename().map(|name| self.dir.path().join(name))
 	}
 
-	/// Returns `None` when the directory hasn't finished filtering image files.
+	/// Returns `None` while the very first folder is being listed.
 	pub fn current_file_index(&mut self) -> Option<usize> {
+		self.sync_directory();
 		self.dir.curr_img_index()
 	}
 
-	/// Returns `None` when the directory hasn't finished filtering image files.
+	/// Returns `None` while the very first folder is being listed.
 	pub fn current_dir_len(&mut self) -> Option<usize> {
+		self.sync_directory();
 		self.dir.image_count()
 	}
 
@@ -344,37 +534,59 @@ impl ImageCache {
 
 	/// Returns tru if and only if the current image has been fully loaded and it has a single frame.
 	pub fn loaded_still_image(&self) -> bool {
-		if let Some(desc) = self.dir.curr_descriptor() {
-			if let Some(img) = self.texture_cache.get(&desc.request_id) {
-				if img.fully_loaded && img.frames.len() == 1 {
-					return true;
-				}
-			}
+		if let Some(desc) = self.dir.curr_descriptor()
+			&& let Some(img) = self.texture_cache.get(&desc.request_id)
+			&& img.fully_loaded
+			&& img.frames.len() == 1
+			&& !img.truncated
+		{
+			return true;
 		}
 		false
 	}
 
-	/// Fetches the contents of the folder and stores the list of image filenames to know which
-	/// files will be the next and previous.
-	///
-	/// Tries to locate the image that was the current image before calling the function and
-	/// keeping it current. If that filename is not found, than it tries to preserve the previous
-	/// file index instead of the filename. If there is no such an index in the folder, it resets
-	/// the index to 0 making the current file the first one in the folder.
-	///
-	/// Returns the error that might occure while fetching the files from the directory. Otherwise
-	/// returns `Ok(())`
-	pub fn update_directory(&mut self) -> directory::Result<()> {
-		self.dir.update_directory()?;
+	/// True while loaded results are waiting to be received or uploaded.
+	pub fn has_pending_requests(&self) -> bool {
+		self.pending_requests.has_work()
+	}
 
-		// indicate that the an update directory
-		// call was made since those were created and they should all be
+	/// Starts listing the shown folder again in the background. When the listing arrives (see
+	/// `listing_pending`) it replaces the current one; the current file stays current, or the
+	/// image that took its place if the file is gone.
+	pub fn update_directory(&mut self) {
+		self.dir.update_directory();
+	}
+
+	/// Whether a folder listing is still being produced in the background.
+	pub fn listing_pending(&mut self) -> bool {
+		self.sync_directory();
+		self.dir.listing_pending()
+	}
+
+	/// Takes in the folder listing the background thread has finished, if any. What belongs to
+	/// files that are no longer listed is dropped, their pending decodes are cancelled.
+	fn sync_directory(&mut self) {
+		let Some(change) = self.dir.poll_listing() else {
+			return;
+		};
+		let dir = &self.dir;
+		self.texture_cache.retain(|req_id, _| dir.has_request(*req_id));
+		self.pending_requests.retain(|req_id| dir.has_request(req_id));
+
+		// The files may have changed since they were decoded: they are all
 		// checked against the modification time of the file system file.
 		for texture in self.texture_cache.values_mut() {
 			texture.needs_update = true;
 		}
+		if change == ListingChange::NewDirectory {
+			self.current_frame_idx = 0;
+		}
+	}
 
-		Ok(())
+	/// Path of the folder entry at `index`, or `None` if there is no such image.
+	pub fn path_by_index(&mut self, index: usize) -> Option<PathBuf> {
+		self.sync_directory();
+		self.dir.image_by_index(index).map(|item| item.path.clone())
 	}
 
 	pub fn load_at_index(
@@ -383,6 +595,7 @@ impl ImageCache {
 		index: usize,
 		frame_id: Option<isize>,
 	) -> PathedTextureResult {
+		self.sync_directory();
 		let path = self
 			.dir
 			.image_by_index(index)
@@ -390,13 +603,25 @@ impl ImageCache {
 			.path
 			.clone();
 
-		let result = self.load_specific(display, &path, frame_id);
+		let result = self.load_synced(display, &path, frame_id);
 		Ok((path, result))
 	}
 
-	/// Returns `Err(errors::Error::from_kind(errors::ErrorKind::WaitingOnLoader))`
-	/// when the image
+	/// Returns `Err(TextureError::WaitingOnLoader)` while the image is loading and
+	/// `Err(TextureError::WaitingOnListing)` while the folder of `path` is being listed.
 	pub fn load_specific(
+		&mut self,
+		display: &gelatin::Display,
+		path: &Path,
+		frame_id: Option<isize>,
+	) -> TextureResult<AnimationFrameTexture> {
+		self.sync_directory();
+		self.load_synced(display, path, frame_id)
+	}
+
+	/// `load_specific` for callers that have just called `sync_directory`: the listing must
+	/// not change between resolving `path` and loading it.
+	fn load_synced(
 		&mut self,
 		display: &gelatin::Display,
 		path: &Path,
@@ -405,30 +630,24 @@ impl ImageCache {
 		trace!("Begin `load_specific`");
 		self.receive_prefetched();
 		trace!("Receive prefetched done");
-		let target_file_name;
-		let parent;
-		if path.is_dir() {
-			parent = path.to_owned();
-			target_file_name = None;
+		let (target_file_name, parent) = if path.is_dir() {
+			(None, path.to_owned())
 		} else {
-			let filename_and_parent = get_file_name_and_parent(path)?;
-			target_file_name = Some(filename_and_parent.0);
-			parent = filename_and_parent.1;
-		}
+			let (file_name, parent) = get_file_name_and_parent(path)?;
+			(Some(file_name), parent)
+		};
 
 		let prev_img_index = self.dir.curr_img_index();
-		if let Some(target_file_name) = target_file_name {
-			self.change_directory_with_filename(&parent, &target_file_name)?;
-		} else {
-			self.change_directory(&parent)?;
-			self.current_frame_idx = 0;
+		let listed = match &target_file_name {
+			Some(file_name) => self.dir.change_directory_with_filename(&parent, file_name)?,
+			None => self.dir.change_directory(&parent)?,
+		};
+		if !listed {
+			// The previous listing stays in use meanwhile; the caller asks again.
+			return Err(TextureError::WaitingOnListing);
 		}
-		if self.dir.path() != parent {
-			let DirItem { path, request_id } = self.curr_dir_item().ok_or_else(|| {
-				TextureError::Other("Could not get path for current image".into())
-			})?;
-			self.send_request_for_file(path, request_id, RequestKind::Priority { display });
-			return Err(TextureError::WaitingOnLoader);
+		if target_file_name.is_none() {
+			self.current_frame_idx = 0;
 		}
 		if let Some(img_index) = self.dir.curr_img_index() {
 			self.dir.set_curr_img_index(img_index)?;
@@ -437,12 +656,11 @@ impl ImageCache {
 			Some(frame_id) => frame_id,
 			None => {
 				let mut retval = 0;
-				if let Some(prev_img_index) = prev_img_index {
-					if let Some(curr_img_index) = self.dir.curr_img_index() {
-						if curr_img_index == prev_img_index {
-							retval = self.current_frame_idx as isize;
-						}
-					}
+				if let Some(prev_img_index) = prev_img_index
+					&& let Some(curr_img_index) = self.dir.curr_img_index()
+					&& curr_img_index == prev_img_index
+				{
+					retval = self.current_frame_idx as isize;
 				}
 				retval
 			}
@@ -453,32 +671,25 @@ impl ImageCache {
 
 	fn refresh_cache(&mut self) {
 		trace!("Begin `refresh_cache`");
-		if let Some(curr_index) = self.dir.curr_img_index() {
-			let cache = mem::take(&mut self.texture_cache);
-
-			// Delete all entries that are outside the range of files around the current file
-			// allowed by the capacity.
-			// Walk through our list of directory entries sorted by their distance from the current
-			// file and in each step remove an entry from the cache until we reach the desired cache
-			// size
-			let mut sorted_files: Vec<_> = cache.into_iter().enumerate().collect();
-			sorted_files
-				.sort_unstable_by_key(|&(index, _)| (index as isize - curr_index as isize).abs());
-			self.remaining_capacity = self.total_capacity;
-			sorted_files.retain(|(_, (_, texture))| {
-				// TODO consider retaining individual frames.
-				let all_frames_size = get_anim_size_estimate(&texture.frames);
-
-				if self.remaining_capacity > (all_frames_size + self.curr_est_size) {
-					self.remaining_capacity -= all_frames_size;
-					true
-				} else {
-					false
-				}
-			});
-
-			self.texture_cache = sorted_files.into_iter().map(|(_, entry)| entry).collect();
-		}
+		let (Some(curr_index), Some(count)) = (self.dir.curr_img_index(), self.dir.image_count())
+		else {
+			return;
+		};
+		// Entries of files that are no longer images of the folder are dropped. The others are
+		// ordered by how many images they are from the current one (the folder wraps around).
+		let entries = self
+			.texture_cache
+			.iter()
+			.filter_map(|(&req_id, texture)| {
+				let index = self.dir.img_index_of_request(req_id)?;
+				let distance = index.abs_diff(curr_index);
+				let size = get_anim_size_estimate(&texture.frames);
+				Some((req_id, distance.min(count - distance), size))
+			})
+			.collect();
+		let capacity = self.total_capacity.saturating_sub(self.pending_requests.reserved_total());
+		let keep: HashSet<u32> = select_cache_entries(entries, capacity).into_iter().collect();
+		self.texture_cache.retain(|req_id, _| keep.contains(req_id));
 	}
 
 	pub fn load_next(&mut self, display: &gelatin::Display) -> PathedTextureResult {
@@ -494,6 +705,7 @@ impl ImageCache {
 		file_jump_count: i32,
 		frame_jump_count: isize,
 	) -> PathedTextureResult {
+		self.sync_directory();
 		if file_jump_count == 0 {
 			// Here, it is possible that the current image was already
 			// requested but not yet loaded.
@@ -515,20 +727,33 @@ impl ImageCache {
 			} else {
 				self.dir.jump_to_prev();
 			}
-			target_path = self.dir.curr_descriptor().unwrap().path.clone();
+			target_path = self
+				.dir
+				.curr_descriptor()
+				.ok_or(PathResolutionError::NotYetSpecified)?
+				.path
+				.clone();
 		} else if let (Some(curr_index), Some(img_count)) =
 			(self.dir.curr_img_index(), self.dir.image_count())
+			&& img_count > 0
 		{
 			// rem_euclid calculates the least nonnegative remainder
 			let target_index = (curr_index as isize + file_jump_count as isize)
 				.rem_euclid(img_count as isize) as usize;
 
-			target_path = self.dir.image_by_index(target_index).unwrap().path.clone();
+			target_path = self
+				.dir
+				.image_by_index(target_index)
+				.ok_or(PathResolutionError::NotYetSpecified)?
+				.path
+				.clone();
 		} else {
-			log::info!("Folder is empty, no folder was open, or folder hasn't finished filtering when trying to jump to an image by index.");
+			log::info!(
+				"Folder is empty, no folder was open, or folder hasn't finished filtering when trying to jump to an image by index."
+			);
 			return Err(PathResolutionError::NotYetSpecified);
 		}
-		let result = self.load_specific(display, &target_path, None);
+		let result = self.load_synced(display, &target_path, None);
 		Ok((target_path, result))
 	}
 
@@ -539,7 +764,10 @@ impl ImageCache {
 				Ok(load_result) => {
 					self.pending_requests.add_load_result(load_result);
 				}
-				Err(TryRecvError::Disconnected) => panic!("Channel disconnected unexpectidly."),
+				Err(TryRecvError::Disconnected) => {
+					log::error!("The image loader threads stopped unexpectedly.");
+					break;
+				}
 				Err(TryRecvError::Empty) => break,
 			}
 		}
@@ -603,41 +831,41 @@ impl ImageCache {
 			// And just let the next blok deal with locating the appropriate frame.
 		}
 
+		// Prefetching decoded only the first frame of an animation: load the rest now.
+		if self.texture_cache.get(&req_id).is_some_and(|tex| tex.truncated) {
+			self.send_request_for_file(path.clone(), req_id, RequestKind::Priority { display });
+		}
+
 		// Check if it is inside the texture cache first
 		if let Some(tex) = self.texture_cache.get(&req_id) {
 			if tex.failed {
 				return Err(TextureError::from_failed_request(req_id));
 			}
 			let modified = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-			let mut get_from_cache = false;
-			if let Some(curr_mod_time) = modified {
-				if let Some(mod_time) = tex.mod_time {
-					if mod_time == curr_mod_time {
-						get_from_cache = true;
-					}
+			// A file that changed since it was decoded has to be decoded again.
+			let stale = matches!((modified, tex.mod_time), (Some(now), Some(then)) if now != then);
+			if !stale {
+				if tex.replacing {
+					return Err(TextureError::WaitingOnLoader);
 				}
-			} else {
-				get_from_cache = true;
-			}
-			if get_from_cache {
 				let count = tex.frames.len() as isize;
-				if tex.fully_loaded || (frame_id >= 0 && frame_id < count) {
-					let wrapped_id;
-					if frame_id < 0 {
-						wrapped_id = count + (frame_id % count);
-					} else {
-						wrapped_id = frame_id % count;
-					}
+				if tex.fully_loaded && count == 0 {
+					return Err(TextureError::from_failed_request(req_id));
+				}
+				if count > 0 && (tex.fully_loaded || (frame_id >= 0 && frame_id < count)) {
+					let wrapped_id =
+						if frame_id < 0 { count + (frame_id % count) } else { frame_id % count };
 					if let Some(frame) = tex.frames.get(wrapped_id as usize) {
 						self.current_frame_idx = wrapped_id as usize;
 						return Ok(frame.clone());
 					}
 				}
+				return Err(TextureError::WaitingOnLoader);
 			}
-			return Err(TextureError::WaitingOnLoader);
+			self.texture_cache.remove(&req_id);
 		}
 		if self.pending_requests.contains(&req_id) {
-			PRIORITY_REQUEST_ID.store(req_id, Ordering::SeqCst);
+			self.loader.set_priority(req_id);
 			return Err(TextureError::WaitingOnLoader);
 		}
 		self.send_request_for_file(path, req_id, RequestKind::Priority { display });
@@ -655,11 +883,7 @@ impl ImageCache {
 		match load_result {
 			LoadResult::Start { req_id, metadata } => {
 				let curr_mod_time = metadata.modified().ok();
-				if let Some(cancelled) = self.pending_requests.cancelled(&req_id) {
-					if cancelled {
-						return Ok(None);
-					}
-				} else {
+				if !self.pending_requests.contains(&req_id) {
 					return Ok(None);
 				}
 				match self.texture_cache.entry(req_id) {
@@ -670,130 +894,132 @@ impl ImageCache {
 							fully_loaded: false,
 							mod_time: curr_mod_time,
 							failed: false,
+							truncated: false,
+							replacing: false,
 							frames: Vec::new(),
 						});
 					}
 					Entry::Occupied(mut entry) => {
-						let mut overwrite = true;
-						if let Some(curr_mod_time) = curr_mod_time {
-							let cached = entry.get();
-							if let Some(existing_mod_time) = cached.mod_time {
-								if existing_mod_time == curr_mod_time {
-									overwrite = false;
-								}
-							}
-						}
-						if overwrite {
-							let old_size_estimate = get_anim_size_estimate(&entry.get().frames);
-							self.remaining_capacity += old_size_estimate;
-							let mut_entry = entry.get_mut();
-							mut_entry.frames.clear();
-							mut_entry.mod_time = curr_mod_time;
+						// Loaded again: the file changed, or only its first frame was loaded.
+						let cached = entry.get_mut();
+						// A sharper render of an SVG replaces its frame when it arrives.
+						if !cached.replacing {
+							cached.frames.clear();
+							cached.fully_loaded = false;
+							cached.truncated = false;
+							cached.mod_time = curr_mod_time;
 						}
 					}
 				}
 				Ok(None)
 			}
-			LoadResult::Frame { req_id, image, delay_nano, orientation } => {
-				if let Some(cancelled) = self.pending_requests.cancelled(&req_id) {
-					if cancelled {
-						return Ok(None);
-					}
-				} else {
+			LoadResult::Frame { req_id, image, delay_nano, orientation, primaries, svg } => {
+				if !self.pending_requests.contains(&req_id) {
 					return Ok(None);
 				}
-				let size_estimate = get_image_size_estimate(image.width(), image.height());
 				if let Some(entry) = self.texture_cache.get_mut(&req_id) {
-					let anim_frame =
-						AnimationFrameTexture::from_image(display, image, delay_nano, orientation)?;
+					let anim_frame = AnimationFrameTexture::from_image(
+						display,
+						image,
+						delay_nano,
+						orientation,
+						primaries,
+						svg,
+					)?;
+					if entry.replacing {
+						entry.replacing = false;
+						entry.frames.clear();
+					}
 					entry.frames.push(anim_frame.clone());
-					self.remaining_capacity -= size_estimate;
 					return Ok(Some(anim_frame));
 				}
 				Ok(None)
 			}
-			LoadResult::Done { req_id } => {
+			LoadResult::Done { req_id, truncated } => {
 				if let Some(tex) = self.texture_cache.get_mut(&req_id) {
 					tex.fully_loaded = true;
+					tex.truncated = truncated;
+					tex.replacing = false;
 				}
-				let _ = PRIORITY_REQUEST_ID.compare_exchange(
-					req_id,
-					NON_EXISTENT_REQUEST_ID,
-					Ordering::SeqCst,
-					Ordering::SeqCst,
-				);
+				self.loader.clear_priority(req_id);
 				self.pending_requests.set_finished(&req_id);
 				Ok(None)
 			}
 			LoadResult::Failed { req_id } => {
+				self.loader.clear_priority(req_id);
+				self.pending_requests.set_finished(&req_id);
 				if let Some(tex) = self.texture_cache.get_mut(&req_id) {
+					if tex.replacing {
+						// The sharper render failed: the one on screen stays.
+						tex.replacing = false;
+						return Ok(None);
+					}
 					tex.fully_loaded = true;
 					tex.failed = true;
 				}
-				let _ = PRIORITY_REQUEST_ID.compare_exchange(
-					req_id,
-					NON_EXISTENT_REQUEST_ID,
-					Ordering::SeqCst,
-					Ordering::SeqCst,
-				);
-				self.pending_requests.set_finished(&req_id);
 				Err(TextureError::from_failed_request(req_id))
 			}
 		}
 	}
 
+	/// Requests the images around the current one, nearest first, alternating sides
+	/// (+1, -1, +2, -2, ...) and wrapping around like next/previous do. Images that are
+	/// already cached or requested are skipped; it stops when the budget or the limit
+	/// of pending requests is reached.
 	pub fn prefetch_neighbors(&mut self) {
-		if let Some(mut index) = self.dir.curr_img_index() {
-			// Send enough load requests so that the estimated total will just fill the cache
-			let mut estimated_remaining_cap = self.remaining_capacity;
-
-			while estimated_remaining_cap > self.curr_est_size {
-				// Send a load request for the closest file not in the cache or outdated
-				index += 1;
-				if self.prefetch_at_index(index) {
-					estimated_remaining_cap -= self.curr_est_size;
-				} else {
-					break;
-				}
+		self.sync_directory();
+		let (Some(curr_index), Some(count)) = (self.dir.curr_img_index(), self.dir.image_count())
+		else {
+			return;
+		};
+		for index in prefetch_order(curr_index, count) {
+			if self.prefetch_index(index) == SendOutcome::Blocked {
+				return;
 			}
 		}
 	}
 
+	/// Returns true if a request was sent.
 	pub fn prefetch_at_index(&mut self, index: usize) -> bool {
-		if self.remaining_capacity > self.curr_est_size {
-			let params =
-				self.dir.image_by_index(index).map(|desc| (desc.path.clone(), desc.request_id));
-			if let Some((path, req_id)) = params {
-				return self.send_request_for_file(path, req_id, RequestKind::NonPriority);
-			} else {
-				return false;
-			}
-		}
-		false
+		self.sync_directory();
+		self.prefetch_index(index) == SendOutcome::Sent
 	}
 
-	/// This is almost identical to `prefetch_at_index` but this function
-	/// does not check the `remaining_capacity`.
+	fn prefetch_index(&mut self, index: usize) -> SendOutcome {
+		let params =
+			self.dir.image_by_index(index).map(|desc| (desc.path.clone(), desc.request_id));
+		match params {
+			Some((path, req_id)) => {
+				self.send_request_for_file(path, req_id, RequestKind::NonPriority)
+			}
+			None => SendOutcome::Blocked,
+		}
+	}
+
+	/// Priority requests ignore the cache capacity, prefetch requests are only sent while their
+	/// estimated size fits in it. The estimate is reserved until the request finishes.
 	fn send_request_for_file(
 		&mut self,
 		file_path: PathBuf,
 		req_id: u32,
 		kind: RequestKind,
-	) -> bool {
-		if let RequestKind::Priority { display } = kind {
-			if self.pending_requests.len() >= Self::MAX_PENDING_REQUESTS {
-				if let Err(e) = self.process_prefetched(display) {
-					eprintln!("Error while processing prefetched images:\n{}", e);
-				}
-			}
+	) -> SendOutcome {
+		if let RequestKind::Priority { display } = kind
+			&& self.pending_requests.len() >= Self::MAX_PENDING_REQUESTS
+			&& let Err(e) = self.process_prefetched(display)
+		{
+			log::error!("Error while processing prefetched images:\n{}", e);
 		}
 		if self.pending_requests.len() >= Self::MAX_PENDING_REQUESTS {
-			return false;
+			return SendOutcome::Blocked;
 		}
+		let priority = kind.priority();
 		let mut cache_enty_invalid = false;
 		if let Some(texture) = self.texture_cache.get_mut(&req_id) {
-			if !texture.needs_update {
-				return false;
+			if priority && texture.truncated {
+				// Prefetching left out the frames after the first one, they are wanted now.
+			} else if !texture.needs_update {
+				return SendOutcome::Skipped;
 			} else {
 				texture.needs_update = false;
 				if let Some(existing_mod_time) = texture.mod_time {
@@ -801,7 +1027,7 @@ impl ImageCache {
 						fs::metadata(&file_path).ok().and_then(|m| m.modified().ok());
 					if let Some(new_mod_time) = new_mod_time {
 						if new_mod_time == existing_mod_time {
-							return false;
+							return SendOutcome::Skipped;
 						} else {
 							cache_enty_invalid = true;
 						}
@@ -812,76 +1038,41 @@ impl ImageCache {
 		if cache_enty_invalid {
 			self.texture_cache.remove(&req_id);
 		}
-		if kind.priority() {
-			PRIORITY_REQUEST_ID.store(req_id, Ordering::SeqCst);
+		if priority {
+			self.loader.set_priority(req_id);
 		}
 		if self.pending_requests.contains(&req_id) {
-			return false;
+			return SendOutcome::Skipped;
 		}
-		let request = LoadRequest { req_id, path: file_path };
-		self.pending_requests.add_request(request.clone());
+		let reserved = estimate_file_size(&file_path);
+		if !priority && reserved > self.remaining_capacity() {
+			return SendOutcome::Blocked;
+		}
+		if priority
+			&& let Some(texture) = self.texture_cache.get_mut(&req_id)
+			&& texture.truncated
+		{
+			// The animation is loaded again from the start. Until its first frame arrives
+			// the cached one keeps being served.
+			texture.truncated = false;
+			texture.fully_loaded = false;
+		}
+		// Prefetches only decode the first frame of animations.
+		let mut request = LoadRequest::new(req_id, file_path, priority);
+		request.svg_fit = self.svg_view;
+		self.pending_requests.add_request(&request, reserved);
 		self.loader.send_load_request(request);
-		true
+		SendOutcome::Sent
 	}
+}
 
-	fn change_directory(&mut self, dir_path: &Path) -> directory::Result<()> {
-		if self.dir.path() == dir_path {
-			return Ok(());
-		}
-		self.texture_cache.clear();
-		self.remaining_capacity = self.total_capacity;
-
-		// Cancel all pending load requests
-		for (_, request) in self.pending_requests.iter_mut() {
-			request.cancel();
-		}
-
-		self.dir.change_directory(dir_path)?;
-		Ok(())
-	}
-
-	fn change_directory_with_filename(
-		&mut self,
-		dir_path: &Path,
-		filename: &OsStr,
-	) -> directory::Result<()> {
-		self.dir.change_directory_with_filename(dir_path, filename)
-	}
-
-	// fn collect_directory(&mut self) -> Result<Vec<DirItem>> {
-	// 	let start = std::time::Instant::now();
-	// 	let mut dir_files: Vec<_> = fs::read_dir(&self.dir.path)?
-	// 		.filter_map(|x| match x {
-	// 			Ok(entry) => match entry.file_type() {
-	// 				Ok(file_type) => {
-	// 					if file_type.is_file() || file_type.is_symlink() {
-	// 						if is_file_supported(entry.path().as_path()) {
-	// 							self.current_req_id += 1;
-	// 							Some(DirItem { dir_entry: entry, request_id: self.current_req_id })
-	// 						} else {
-	// 							None
-	// 						}
-	// 					} else {
-	// 						None
-	// 					}
-	// 				}
-	// 				Err(_) => None,
-	// 			},
-	// 			Err(_) => None,
-	// 		})
-	// 		.collect();
-
-	// 	let total_time = start.elapsed();
-	// 	println!("Collected directory in: {} ms", total_time.as_millis());
-	// 	dir_files.sort_unstable_by(|a, b| {
-	// 		lexical_sort::natural_lexical_cmp(
-	// 			&a.dir_entry.file_name().to_string_lossy(),
-	// 			&b.dir_entry.file_name().to_string_lossy(),
-	// 		)
-	// 	});
-
-	// 	Ok(dir_files)
-	// }
+/// The other indices of `count` images in the order they are prefetched around `curr`: nearest
+/// first, alternating forward and back (+1, -1, +2, -2, ...), wrapping around, each once.
+fn prefetch_order(curr: usize, count: usize) -> impl Iterator<Item = usize> {
+	(1..=count / 2)
+		.flat_map(move |offset| [(curr + offset) % count, (curr + count - offset) % count])
+		// With an even count the last offset reaches the same image from both sides.
+		.take(count.saturating_sub(1))
 }
 
 fn get_file_name_and_parent(path: &Path) -> std::io::Result<(OsString, PathBuf)> {
@@ -890,7 +1081,7 @@ fn get_file_name_and_parent(path: &Path) -> std::io::Result<(OsString, PathBuf)>
 	let file_name = match path.file_name() {
 		Some(f) => f.to_owned(),
 		None => {
-			return Err(io::Error::other(format!("Could not get file name from path {:?}", path)))
+			return Err(io::Error::other(format!("Could not get file name from path {:?}", path)));
 		}
 	};
 	let parent = match path.parent() {
@@ -914,4 +1105,22 @@ fn get_file_name_and_parent(path: &Path) -> std::io::Result<(OsString, PathBuf)>
 	};
 
 	Ok((file_name, parent))
+}
+
+#[cfg(test)]
+mod eviction_tests {
+	use super::*;
+
+	#[test]
+	fn nearest_entries_survive_and_current_is_always_kept() {
+		const SIZE: isize = 10;
+		// (req_id, distance, size): req ids deliberately not in distance order.
+		let entries = vec![(1, 5, SIZE), (2, 1, SIZE), (3, 0, SIZE), (4, 2, SIZE), (5, 1, SIZE)];
+		// Room for the current image and two entries next to it, not for the one two steps away.
+		let capacity = 3 * SIZE + SIZE / 2 + UNKNOWN_SIZE_ESTIMATE;
+		assert_eq!(select_cache_entries(entries, capacity), vec![3, 2, 5]);
+
+		// An image bigger than the whole capacity is still kept when it is the current one.
+		assert_eq!(select_cache_entries(vec![(7, 0, isize::MAX)], 1), vec![7]);
+	}
 }
