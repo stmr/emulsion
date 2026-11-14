@@ -6,12 +6,12 @@ use std::iter;
 use std::panic;
 use std::string::String;
 
-use backtrace::Backtrace;
+use std::backtrace::Backtrace;
 
 use crate::PROJECT_DIRS;
 
 pub fn handle_panic(info: &panic::PanicHookInfo) {
-	let trace = Backtrace::new();
+	let trace = Backtrace::force_capture();
 
 	let mut msg = String::new();
 
@@ -33,31 +33,36 @@ pub fn handle_panic(info: &panic::PanicHookInfo) {
 			location.column()
 		));
 	}
-	msg.push_str(&format!("{:?}\n", trace));
+	msg.push_str(&format!("{trace}\n"));
 	for ch in iter::repeat_n('=', 99) {
 		msg.push(ch);
 	}
 
-	eprintln!("\nPanic happened{}", &msg);
-	write_to_file(&msg).expect("Could not write panic to file.");
+	eprintln!("\nPanic happened{}", msg);
+	if let Err(e) = write_to_file(&msg) {
+		eprintln!("Could not write panic to file: {e}");
+	}
 }
 
+/// Past this size the log is rotated to `panic.old.txt` so it cannot grow without bound.
+const MAX_PANIC_LOG_BYTES: u64 = 1024 * 1024;
+
 fn write_to_file(msg: &str) -> io::Result<()> {
-	let local_data_folder;
-	if let Some(ref project_dirs) = *PROJECT_DIRS {
-		local_data_folder = project_dirs.data_local_dir().to_owned();
+	let local_data_folder = if let Some(project_dirs) = &*PROJECT_DIRS {
+		project_dirs.data_local_dir().to_owned()
 	} else {
 		let curr_exe = env::current_exe()?;
-		let curr_exe_dir = curr_exe
+		curr_exe
 			.parent()
-			.ok_or_else(|| io::Error::other("Could not get exe parent folder!"))?;
-		local_data_folder = curr_exe_dir.to_owned();
+			.ok_or_else(|| io::Error::other("Could not get exe parent folder!"))?
+			.to_owned()
+	};
+	std::fs::create_dir_all(&local_data_folder)?;
+	let path = local_data_folder.join("panic.txt");
+	if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_PANIC_LOG_BYTES) {
+		std::fs::rename(&path, local_data_folder.join("panic.old.txt"))?;
 	}
-	if !local_data_folder.exists() {
-		std::fs::create_dir_all(&local_data_folder).unwrap();
-	}
-	let mut file =
-		OpenOptions::new().create(true).append(true).open(local_data_folder.join("panic.txt"))?;
+	let mut file = OpenOptions::new().create(true).append(true).open(path)?;
 
 	write!(file, "{}", msg)?;
 	Ok(())
