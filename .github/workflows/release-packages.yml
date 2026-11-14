@@ -1,39 +1,40 @@
-name: Draft New Release with Distributables
+name: Build Release Packages
 
 on:
   workflow_dispatch:
   push:
-    # Sequence of patterns matched against refs/tags
     tags:
-    - 'v*' # Push events to matching v*, i.e. v1.0, v20.15.10
+    - 'v*'
+
+permissions:
+  contents: read
 
 jobs:
-  create_release:
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-      version: ${{ steps.get_version.outputs.VERSION }}
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
     steps:
-    - name: Get the version
-      id: get_version
-      run: echo ::set-output name=VERSION::${GITHUB_REF/refs\/tags\//}
-    - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ github.ref }}
-        release_name: Release ${{ github.ref }}
-        draft: true
-        prerelease: false
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+    - name: Install Linux build dependencies
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libxi-dev libgl1-mesa-dev libxkbcommon-dev libwayland-dev libgtk-3-dev libxdo-dev
+    - name: Run tests
+      run: cargo test --workspace --locked --features=networking
 
   windows:
-    needs: create_release
     runs-on: windows-latest
+    needs: test
     env:
-      EMULSION_VERSION: ${{ needs.create_release.outputs.version }}
-      INSTALLER_NAME: ${{ format('Emulsion-Windows-{0}.exe', needs.create_release.outputs.version) }}
+      EMULSION_VERSION: ${{ github.ref_name }}
+      INSTALLER_NAME: ${{ format('Emulsion-Windows-{0}.exe', github.ref_name) }}
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -44,17 +45,23 @@ jobs:
         Write-Host $Env:INSTALLER_NAME
     - name: Install NSIS
       run: |
-        iex "& {$(irm get.scoop.sh)} -RunAsAdmin"
-        scoop bucket add extras
-        scoop install nsis
-        "$env:USERPROFILE\scoop\shims" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        choco install nsis --version=3.12.0 --no-progress -y
+        "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
     - name: Print NSIS version
       run: |
         Write-Host "Path: $env:PATH"
         makensis -VERSION
     - name: Fetch Prerequisites
       working-directory: ./distribution/windows/prerequisites
-      run: (New-Object System.Net.WebClient).DownloadFile('https://aka.ms/vs/16/release/vc_redist.x64.exe', 'vc_redist.x64.exe')
+      run: |
+        Invoke-WebRequest -UseBasicParsing -Uri 'https://aka.ms/vs/16/release/vc_redist.x64.exe' -OutFile vc_redist.x64.exe
+        # The download URL always serves the latest build, so a fixed hash cannot be pinned;
+        # require a valid Microsoft Authenticode signature instead.
+        $sig = Get-AuthenticodeSignature vc_redist.x64.exe
+        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+          throw "vc_redist.x64.exe has an invalid or unexpected signature: $($sig.Status) $($sig.SignerCertificate.Subject)"
+        }
+        Write-Host "vc_redist.x64.exe signed by $($sig.SignerCertificate.Subject)"
 
     - name: Install avif build dependencies (Windows)
       run: |
@@ -72,7 +79,7 @@ jobs:
         echo "SYSTEM_DEPS_BUILD_INTERNAL=always" >> $env:GITHUB_ENV
         echo "SYSTEM_DEPS_LINK=static" >> $env:GITHUB_ENV
 
-    - name: where gcc 
+    - name: where gcc
       run: |
         echo $Env:PATH
         echo $(where gcc)
@@ -103,7 +110,7 @@ jobs:
         echo $content
         $Env:PATH = $content
 
-        cargo build --release --features=networking,avif
+        cargo build --release --locked --features=networking,avif
 
     - name: Copy executable to distributable folder
       working-directory: ./distribution/windows/
@@ -116,71 +123,60 @@ jobs:
       shell: pwsh
       run: |
         makensis /DVERSION=$Env:EMULSION_VERSION emulsion.nsi
-    - name: Upload Release Asset
-      id: upload-release-asset 
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        Move-Item -Force Emulsion-Installer.exe $Env:INSTALLER_NAME
+    - name: Upload Windows package
+      uses: actions/upload-artifact@v4
       with:
-        upload_url: ${{ needs.create_release.outputs.upload_url }} 
-        asset_path: ./distribution/windows/Emulsion-Installer.exe
-        asset_name: ${{ env.INSTALLER_NAME }}
-        asset_content_type: application/octet-stream
+        name: windows-package
+        path: distribution/windows/${{ env.INSTALLER_NAME }}
+        if-no-files-found: error
 
   osx:
-    needs: create_release
-    runs-on: macos-latest
+    runs-on: macos-14
+    needs: test
     env:
-      INSTALLER_NAME: ${{ format('Emulsion-OSX-{0}.dmg', needs.create_release.outputs.version) }}
+      INSTALLER_NAME: ${{ format('Emulsion-OSX-{0}.dmg', github.ref_name) }}
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-apple-darwin,x86_64-apple-darwin
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
     - name: Install cargo bundle
-      run: cargo install cargo-bundle
+      run: cargo install cargo-bundle --version 0.11.0 --locked
     - name: Install avif build dependencies (macOS)
-      run: |
-        brew install meson ninja nasm
-    - name: Setup dav1d (macOS)
-      env:
-        DAV1D_DIR: dav1d_dir
-        LIB_PATH: lib
-      run: |
-        echo "SYSTEM_DEPS_DAV1D_LINK=static" >> $GITHUB_ENV
-        echo "SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always" >> $GITHUB_ENV
-
-    - name: Create osx app
-      run: cargo bundle --release --features=avif
+      run: brew install meson ninja nasm
     - name: Install create-dmg
-      run: npm install --global create-dmg
-    - name: Create .dmg file
+      run: npm install --global create-dmg@8.1.0
+    - name: Build macOS Universal 2 package
       run: ./distribution/macos/create_dmg.sh
     - name: Rename .dmg
-      run: mv Emulsion*.dmg Emulsion.dmg
-    - name: Upload Release Asset
-      id: upload-release-asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: mv Emulsion.dmg "$INSTALLER_NAME"
+    - name: Upload macOS package
+      uses: actions/upload-artifact@v4
       with:
-        upload_url: ${{ needs.create_release.outputs.upload_url }}
-        asset_path: Emulsion.dmg
-        asset_name: ${{ env.INSTALLER_NAME }}
-        asset_content_type: application/octet-stream
+        name: macos-package
+        path: ${{ env.INSTALLER_NAME }}
+        if-no-files-found: error
 
   linux:
-    needs: create_release
     runs-on: ubuntu-22.04
+    needs: test
     env:
-      INSTALLER_NAME: ${{ format('Emulsion-Linux.deb-{0}.deb', needs.create_release.outputs.version) }}
+      EMULSION_VERSION: ${{ github.ref_name }}
+      INSTALLER_NAME: ${{ format('Emulsion-Linux.deb-{0}.deb', github.ref_name) }}
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
     - name: Install cargo bundle
-      run: cargo install cargo-bundle
+      run: cargo install cargo-bundle --version 0.11.0 --locked
     - name: Install avif build dependencies (linux)
       run: |
         DEBIAN_FRONTEND=noninteractive sudo apt-get update
@@ -193,16 +189,39 @@ jobs:
         echo "SYSTEM_DEPS_DAV1D_LINK=static" >> $GITHUB_ENV
         echo "SYSTEM_DEPS_DAV1D_BUILD_INTERNAL=always" >> $GITHUB_ENV
     - name: Create deb package
-      run: cargo bundle --release --features=avif
+      # `cargo bundle` has no --locked flag, so build with --locked first and make bundling
+      # skip its own (unlocked) `cargo build`.
+      run: |
+        cargo build --release --locked --features=avif
+        CARGO_BUNDLE_SKIP_BUILD=1 cargo bundle --release --features=avif
     - name: Rename .deb
-      run: mv target/release/bundle/deb/*.deb Emulsion.deb
-    - name: Upload Release Asset
-      id: upload-release-asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        mv target/release/bundle/deb/*.deb Emulsion.deb
+        mv Emulsion.deb "$INSTALLER_NAME"
+    - name: Upload Linux package
+      uses: actions/upload-artifact@v4
       with:
-        upload_url: ${{ needs.create_release.outputs.upload_url }}
-        asset_path: Emulsion.deb
-        asset_name: ${{ env.INSTALLER_NAME }}
-        asset_content_type: application/octet-stream
+        name: linux-package
+        path: ${{ env.INSTALLER_NAME }}
+        if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, osx, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Download package artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: release-assets
+        merge-multiple: true
+    - name: Publish draft GitHub release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.ref_name }}
+        name: Release ${{ github.ref_name }}
+        draft: true
+        prerelease: false
+        files: release-assets/**
