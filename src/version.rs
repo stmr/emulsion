@@ -1,7 +1,9 @@
-use std::fmt;
-use std::{num::ParseIntError, str::FromStr};
+// `Version` only serves the update check, which needs the `networking` feature.
+#[cfg(feature = "networking")]
+use std::{fmt, num::ParseIntError, str::FromStr};
 
 /// A semver version
+#[cfg(feature = "networking")]
 #[derive(Debug, Default, PartialEq, PartialOrd, Eq, Ord)]
 pub struct Version {
 	major: u32,
@@ -9,6 +11,7 @@ pub struct Version {
 	patch: u32,
 }
 
+#[cfg(feature = "networking")]
 impl Version {
 	/// Return the version of the cargo build
 	pub fn cargo_pkg_version() -> Self {
@@ -20,12 +23,25 @@ impl Version {
 	}
 }
 
+/// Commit the binary was built from (`-dirty` with local changes); empty outside a git checkout.
+pub const BUILD_ID: &str = env!("EMULSION_BUILD");
+
+/// `13.0.0 (1a2b3c4d5)`, or just the version when the build id is unknown.
+pub fn display_version() -> String {
+	match BUILD_ID {
+		"" => env!("CARGO_PKG_VERSION").to_owned(),
+		id => format!("{} ({id})", env!("CARGO_PKG_VERSION")),
+	}
+}
+
+#[cfg(feature = "networking")]
 impl fmt::Display for Version {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
 	}
 }
 
+#[cfg(feature = "networking")]
 impl FromStr for Version {
 	type Err = ParseIntError;
 

@@ -184,7 +184,15 @@ fn build_menu() -> (Menu, Submenu, Submenu) {
 		"Emulsion",
 		true,
 		&[
-			&PredefinedMenuItem::about(None, None),
+			&PredefinedMenuItem::about(
+				None,
+				Some(muda::AboutMetadata {
+					short_version: Some(env!("CARGO_PKG_VERSION").into()),
+					version: (!crate::version::BUILD_ID.is_empty())
+						.then(|| crate::version::BUILD_ID.into()),
+					..Default::default()
+				}),
+			),
 			&PredefinedMenuItem::separator(),
 			&PredefinedMenuItem::services(None),
 			&PredefinedMenuItem::separator(),

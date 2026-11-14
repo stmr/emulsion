@@ -34,7 +34,6 @@ use gelatin::{
 
 use crate::configuration::Theme;
 use crate::configuration::{Cache, ConfigWindowSection, Configuration};
-use crate::version::Version;
 use crate::widgets::{
 	bottom_bar::BottomBar,
 	copy_notification::CopyNotifications,

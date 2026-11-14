@@ -1,6 +1,7 @@
-use crate::Version;
+use crate::version::display_version;
 use clap::{Arg, Command, parser::ValueSource, value_parser};
 use std::path::Path;
+use std::sync::LazyLock;
 
 #[derive(Clone)]
 pub struct Args {
@@ -10,20 +11,15 @@ pub struct Args {
 
 /// Parses the command-line arguments and returns the file path
 pub fn parse_args(config_path: &Path, cache_path: &Path) -> Args {
-	// It's okay to leak this, because this code should only be executed once.
-	let config: &'static str = Box::leak(
-		format!(
-			"CONFIGURATION:\n    config file: {}\n    cache file:  {}",
-			config_path.to_string_lossy(),
-			cache_path.to_string_lossy(),
-		)
-		.into_boxed_str(),
+	let config = format!(
+		"CONFIGURATION:\n    config file: {}\n    cache file:  {}",
+		config_path.to_string_lossy(),
+		cache_path.to_string_lossy(),
 	);
-	let version: &'static str =
-		Box::leak(Version::cargo_pkg_version().to_string().into_boxed_str());
+	static VERSION: LazyLock<String> = LazyLock::new(display_version);
 
 	let matches = Command::new("emulsion")
-		.version(version)
+		.version(VERSION.as_str())
 		.author("Artur Barnabas <kovacs.artur.barnabas@gmail.com>")
 		.about(
 			"A fast and minimalistic image viewer\n\

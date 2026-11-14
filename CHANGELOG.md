@@ -1,6 +1,11 @@
-## Unreleased
+## 14.0.0
+
+Major version because key bindings with modifiers now require them (see Changed), which can
+change how an existing `cfg.toml` behaves.
 
 ### Added
+- `--version` and the macOS About panel show the commit the build was made from, with
+  `-dirty` for builds with uncommitted changes
 - Middle click on the image toggles between 1:1 and the current fit mode (Fill or Best fit)
   without changing it; middle click on the gamma slider resets gamma
 - macOS: HEIC/HEIF (iPhone photos) open and get thumbnails through ImageIO with their
