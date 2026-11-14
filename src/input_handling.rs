@@ -284,7 +284,9 @@ mod tests {
 	#[test]
 	fn driver_bracket_shortcuts_navigate_without_touching_gamma() {
 		let config = Rc::new(RefCell::new(Configuration::default()));
-		let with_cmd = ModifiersState::SUPER;
+		// `CmdCtrl` is Cmd on macOS and Ctrl elsewhere.
+		let with_cmd =
+			if cfg!(target_os = "macos") { ModifiersState::SUPER } else { ModifiersState::CONTROL };
 		let bare = ModifiersState::empty();
 		assert!(action_triggered(&config, IMG_PREV_NAME, "[", with_cmd));
 		assert!(action_triggered(&config, IMG_NEXT_NAME, "]", with_cmd));
