@@ -1,6 +1,7 @@
 use std::{
 	collections::hash_map::HashMap,
 	fmt::Debug,
+	marker::PhantomData,
 	rc::Rc,
 	sync::atomic::{AtomicBool, Ordering},
 	time::{Duration, Instant},
@@ -14,12 +15,11 @@ use winit::{
 };
 
 use crate::{
+	NextUpdate,
 	event_loop::{ActiveEventLoop, EventLoop},
 	window::Window,
-	NextUpdate,
 };
 
-// const MAX_SLEEP_DURATION: std::time::Duration = std::time::Duration::from_millis(4);
 static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 pub fn request_exit() {
@@ -75,8 +75,6 @@ fn sanitize_control_flow(event_loop: &WinitActiveEventLoop) {
 	set_control_flow(event_loop, event_loop.control_flow());
 }
 
-// pub type EventHandler<UserEvent> = dyn FnMut(&Event<UserEvent>) -> NextUpdate;
-
 pub struct Application {
 	windows: HashMap<WindowId, Rc<Window>>,
 	first_resume_done: bool,
@@ -93,11 +91,11 @@ impl Application {
 
 	pub fn start_event_loop<UserEvent: Debug + 'static>(
 		&mut self,
-		application_handler: impl ApplicationHandler,
+		application_handler: impl ApplicationHandler<UserEvent>,
 		event_loop: EventLoop<UserEvent>,
 	) {
 		#[cfg(feature = "benchmark")]
-		let mut update_draw_dt = {
+		let update_draw_dt = {
 			let mut last_draw_time = std::time::Instant::now();
 			let mut prev_draw_dts = vec![0f32; 64];
 			let mut prev_draw_dt_index = 0;
@@ -120,7 +118,13 @@ impl Application {
 			}
 		};
 
-		let mut app_with_app_handler = AppWithAppHandler { application: self, application_handler };
+		let mut app_with_app_handler = AppWithAppHandler {
+			application: self,
+			application_handler,
+			user_event: PhantomData,
+			#[cfg(feature = "benchmark")]
+			update_draw_dt: Box::new(update_draw_dt),
+		};
 
 		event_loop.inner.run_app(&mut app_with_app_handler).unwrap();
 	}
@@ -132,15 +136,19 @@ impl Default for Application {
 	}
 }
 
-struct AppWithAppHandler<'a, AppHandler>
+struct AppWithAppHandler<'a, UserEvent, AppHandler>
 where
-	AppHandler: ApplicationHandler,
+	UserEvent: Debug + 'static,
+	AppHandler: ApplicationHandler<UserEvent>,
 {
 	application: &'a mut Application,
 	application_handler: AppHandler,
+	user_event: PhantomData<UserEvent>,
+	#[cfg(feature = "benchmark")]
+	update_draw_dt: Box<dyn FnMut() + 'a>,
 }
 
-pub trait ApplicationHandler {
+pub trait ApplicationHandler<UserEvent: Debug + 'static = ()> {
 	fn handle_can_create_surface(&mut self, event_loop: &mut ActiveEventLoop);
 	fn handle_window_event(
 		&mut self,
@@ -149,17 +157,35 @@ pub trait ApplicationHandler {
 		event: &WindowEvent,
 	) -> NextUpdate;
 
-	// fn resumed(&mut self, event_loop: &ActiveEventLoop<UserEvent>);
-	// fn about_to_wait(&mut self, event_loop: &ActiveEventLoop<UserEvent>);
+	/// Handle an event sent through [`EventLoop::create_proxy`].
+	///
+	/// The default implementation intentionally does nothing.
+	fn handle_user_event(&mut self, _event: UserEvent) {}
+	fn handle_about_to_wait(&mut self) -> NextUpdate {
+		NextUpdate::Latest
+	}
+
+	/// Decide whether a close request should terminate the application.
+	///
+	/// Returning `false` leaves the request to the application, which can
+	/// hide or otherwise manage the window itself. The default preserves
+	/// gelatin's historical exit-on-close behavior.
+	fn should_exit_on_close(
+		&mut self,
+		_event_loop: &ActiveEventLoop,
+		_window_id: WindowId,
+	) -> bool {
+		true
+	}
 
 	fn exiting(&mut self);
 }
 
 impl<'a, UserEvent, AppHandler> WinitApplicationHandler<UserEvent>
-	for AppWithAppHandler<'a, AppHandler>
+	for AppWithAppHandler<'a, UserEvent, AppHandler>
 where
 	UserEvent: Debug + 'static,
-	AppHandler: ApplicationHandler,
+	AppHandler: ApplicationHandler<UserEvent>,
 {
 	fn resumed(&mut self, event_loop: &WinitActiveEventLoop) {
 		if !self.application.first_resume_done {
@@ -170,11 +196,17 @@ where
 		}
 	}
 
+	fn user_event(&mut self, _event_loop: &WinitActiveEventLoop, event: UserEvent) {
+		self.application_handler.handle_user_event(event);
+	}
+
 	fn about_to_wait(&mut self, event_loop: &WinitActiveEventLoop) {
 		if EXIT_REQUESTED.load(Ordering::Relaxed) {
 			event_loop.exit();
 			return;
 		}
+		let app_next_update = self.application_handler.handle_about_to_wait();
+		aggregate_control_flow(event_loop, app_next_update.into());
 		for window in self.application.windows.values() {
 			window.main_events_cleared();
 			if window.redraw_needed() {
@@ -215,11 +247,13 @@ where
 				self.application.windows.get(&window_id).unwrap().redraw().into();
 			aggregate_control_flow(event_loop, new_control_flow);
 			#[cfg(feature = "benchmark")]
-			update_draw_dt();
+			(self.update_draw_dt)();
 		}
-		if let WindowEvent::CloseRequested = event {
-			// This actually wouldn't be okay for a general pupose ui toolkit,
-			// but gelatin is specifically made for emulsion so this is fine hehe
+		if matches!(event, WindowEvent::CloseRequested)
+			&& self.application_handler.should_exit_on_close(
+				&ActiveEventLoop { inner: event_loop, application: self.application },
+				window_id,
+			) {
 			request_exit();
 		}
 		let destroyed;
@@ -228,11 +262,7 @@ where
 		} else {
 			destroyed = false;
 		}
-		self.application
-			.windows
-			.get(&window_id)
-			.unwrap()
-			.process_event::<UserEvent>(event, event_loop);
+		self.application.windows.get(&window_id).unwrap().process_event::<UserEvent>(event);
 		if destroyed {
 			self.application.windows.remove(&window_id);
 		}

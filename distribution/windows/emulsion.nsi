@@ -166,7 +166,13 @@ Section -Prerequisites
     beginVsRedist:
     SetOutPath "$INSTDIR\prerequisites"
     File ".\prerequisites\vc_redist.x64.exe"
-    ExecWait "$INSTDIR\prerequisites\vc_redist.x64.exe"
+    ExecWait '"$INSTDIR\prerequisites\vc_redist.x64.exe" /install /quiet /norestart' $0
+    ; Exit codes: 0 = installed, 1638 = a newer version is already installed,
+    ; 3010 = installed, reboot required.
+    StrCmp $0 0 endVsRedist
+    StrCmp $0 1638 endVsRedist
+    StrCmp $0 3010 endVsRedist
+    MessageBox MB_OK|MB_ICONEXCLAMATION "The Visual C++ Redistributable could not be installed (exit code $0). ${PROGRAM_NAME} may not start until it is installed." /SD IDOK
     endVsRedist:
 SectionEnd
 
@@ -200,11 +206,14 @@ Section Uninstall
     
     Delete "$INSTDIR\emulsion.exe"
     Delete "$INSTDIR\Uninstall.exe"
+    Delete "$INSTDIR\prerequisites\vc_redist.x64.exe"
+    RMDir "$INSTDIR\prerequisites"
     RMDir "$INSTDIR" ; This is okay, rmdir fails if the directory is not empty.
     
     ;Remove registry keys
     DeleteRegKey SHCTX "${REG_PROG_PATH}"
     DeleteRegKey SHCTX "${REG_UNINST_PATH}"
+    DeleteRegValue SHCTX "SOFTWARE\RegisteredApplications" "ArturK.${PROGRAM_NAME}.${VERSION}"
     
     ; Extensions mustn't be unregistered here. They might be associated
     ; with a program other than Emulsion and removing those would be wrong.

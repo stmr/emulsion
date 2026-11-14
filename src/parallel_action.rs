@@ -1,9 +1,8 @@
 use std::sync::{
+	Arc, Condvar, Mutex, PoisonError,
 	atomic::{AtomicBool, Ordering},
-	Arc, Mutex,
 };
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 enum ActionState<InpT, OutT> {
 	Ready,
@@ -15,43 +14,32 @@ enum ActionState<InpT, OutT> {
 struct Shared<InpT, OutT> {
 	run: AtomicBool,
 	state: Mutex<ActionState<InpT, OutT>>,
+	/// Notified when input arrives or the action is being dropped.
+	wake: Condvar,
 }
-
-// struct Processor<InpT, OutT> {
-//     shared: Arc<Shared<InpT, OutT>>,
-// }
-// impl<InpT, OutT> Processor<InpT, OutT> {
-//     fn run<F: FnMut(InpT)->OutT>(&mut self, action: F) {
-
-//     }
-// }
 
 fn run_processor<InpT, OutT, F: FnMut(InpT) -> OutT>(
 	shared: Arc<Shared<InpT, OutT>>,
 	mut action: F,
 ) {
-	while shared.run.load(Ordering::SeqCst) {
-		// Sleep to prevent buisy waiting
-		std::thread::sleep(Duration::from_millis(5));
+	loop {
 		let input = {
 			let mut state = shared.state.lock().unwrap();
-			if let ActionState::InputGiven(_) = &*state {
-				let mut input = ActionState::Pending;
-				std::mem::swap(&mut input, &mut *state);
-				match input {
-					ActionState::InputGiven(inp) => Some(inp),
-					_ => unreachable!(),
+			loop {
+				if !shared.run.load(Ordering::SeqCst) {
+					return;
 				}
-			} else {
-				None
+				match std::mem::replace(&mut *state, ActionState::Pending) {
+					ActionState::InputGiven(input) => break input,
+					other => *state = other,
+				}
+				state = shared.wake.wait(state).unwrap();
 			}
 		}; // let go of the mutex lock
-		if let Some(input) = input {
-			let output = action(input);
-			let mut state = shared.state.lock().unwrap();
-			if let ActionState::Pending = &*state {
-				*state = ActionState::OutputReady(output);
-			}
+		let output = action(input);
+		let mut state = shared.state.lock().unwrap();
+		if let ActionState::Pending = &*state {
+			*state = ActionState::OutputReady(output);
 		}
 	}
 }
@@ -63,12 +51,12 @@ pub struct ParallelAction<InpT, OutT> {
 
 impl<InpT: Send + 'static, OutT: Send + 'static> ParallelAction<InpT, OutT> {
 	pub fn new<F: 'static + Send + FnMut(InpT) -> OutT>(action: F) -> ParallelAction<InpT, OutT> {
-		let shared =
-			Arc::new(Shared { run: AtomicBool::new(true), state: Mutex::new(ActionState::Ready) });
+		let shared = Arc::new(Shared {
+			run: AtomicBool::new(true),
+			state: Mutex::new(ActionState::Ready),
+			wake: Condvar::new(),
+		});
 		let handle = {
-			// let mut processor = Processor {
-			//     shared: shared.clone(),
-			// };
 			let shared = shared.clone();
 			std::thread::spawn(move || {
 				run_processor(shared, action);
@@ -78,10 +66,13 @@ impl<InpT: Send + 'static, OutT: Send + 'static> ParallelAction<InpT, OutT> {
 		ParallelAction { join_handle: Some(handle), shared }
 	}
 
-	/// Returns the given input if the thread is currently occupied
+	/// Replaces any input that was not taken yet. If the action is running for an older input,
+	/// its output is discarded.
 	pub fn give_input(&self, input: InpT) {
 		let mut state = self.shared.state.lock().unwrap();
 		*state = ActionState::InputGiven(input);
+		drop(state);
+		self.shared.wake.notify_one();
 	}
 
 	pub fn try_get_output(&self) -> Option<OutT> {
@@ -97,17 +88,17 @@ impl<InpT: Send + 'static, OutT: Send + 'static> ParallelAction<InpT, OutT> {
 			None
 		}
 	}
-
-	pub fn is_ready(&self) -> bool {
-		let state = self.shared.state.lock().unwrap();
-		matches!(&*state, ActionState::Ready)
-	}
 }
 impl<InpT, OutT> Drop for ParallelAction<InpT, OutT> {
 	fn drop(&mut self) {
 		self.shared.run.store(false, Ordering::SeqCst);
-		if let Some(handle) = self.join_handle.take() {
-			handle.join().unwrap();
+		// Taking the lock first guarantees the worker is either waiting or will see `run == false`.
+		drop(self.shared.state.lock().unwrap_or_else(PoisonError::into_inner));
+		self.shared.wake.notify_all();
+		if let Some(handle) = self.join_handle.take()
+			&& handle.join().is_err()
+		{
+			log::error!("The parallel action worker thread panicked");
 		}
 	}
 }

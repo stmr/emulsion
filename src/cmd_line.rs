@@ -1,5 +1,5 @@
 use crate::Version;
-use clap::{parser::ValueSource, value_parser, Arg, Command};
+use clap::{Arg, Command, parser::ValueSource, value_parser};
 use std::path::Path;
 
 #[derive(Clone)]
@@ -27,7 +27,7 @@ pub fn parse_args(config_path: &Path, cache_path: &Path) -> Args {
 		.author("Artur Barnabas <kovacs.artur.barnabas@gmail.com>")
 		.about(
 			"A fast and minimalistic image viewer\n\
-			https://arturkovacs.github.io/emulsion-website/",
+			https://github.com/stmr/emulsion",
 		)
 		.after_help(config)
 		.arg(

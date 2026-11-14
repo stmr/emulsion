@@ -1,13 +1,11 @@
-//! Idk man
+//! Minimal OpenGL UI toolkit used by Emulsion.
 
 pub use cgmath;
 pub use glium;
 pub use image;
 pub use winit;
 
-use std::{
-	any::Any, error::Error, fmt, ops::Deref, path::PathBuf, rc::Rc, time::Instant, vec::Vec,
-};
+use std::{any::Any, error::Error, fmt, path::PathBuf, rc::Rc, time::Instant, vec::Vec};
 
 use winit::{
 	event::{ElementState, KeyEvent, MouseButton},
@@ -17,8 +15,8 @@ use winit::{
 
 use cgmath::{Matrix4, Vector3};
 use glium::{
-	glutin::surface::WindowSurface, implement_vertex, uniform, Blend, BlendingFunction, Frame,
-	IndexBuffer, LinearBlendingFactor, Program, Rect, Surface, VertexBuffer,
+	Blend, BlendingFunction, Frame, IndexBuffer, LinearBlendingFactor, Program, Rect, Surface,
+	VertexBuffer, glutin::surface::WindowSurface, implement_vertex, uniform,
 };
 
 use misc::*;
@@ -39,13 +37,11 @@ pub type Display = glium::Display<WindowSurface>;
 #[derive(Debug)]
 pub enum WidgetError {
 	Image(image::ImageError),
-	Custom(Box<dyn Error>),
 }
 impl fmt::Display for WidgetError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			WidgetError::Image(img_err) => write!(f, "WidgetError: Image ({})", img_err)?,
-			WidgetError::Custom(err) => write!(f, "WidgetError: Custom ({})", err)?,
 		}
 		Ok(())
 	}
@@ -54,7 +50,6 @@ impl Error for WidgetError {
 	fn source(&self) -> Option<&(dyn Error + 'static)> {
 		match self {
 			WidgetError::Image(img_err) => Some(img_err),
-			WidgetError::Custom(err) => Some(Deref::deref(err)),
 		}
 	}
 }
@@ -318,8 +313,10 @@ macro_rules! add_common_widget_functions {
 		}
 		pub fn set_visible(&self, visible: bool) {
 			let mut borrowed = self.$data_field.borrow_mut();
-			borrowed.visible = visible;
-			borrowed.render_validity.invalidate();
+			if borrowed.visible != visible {
+				borrowed.visible = visible;
+				borrowed.render_validity.invalidate();
+			}
 		}
 	};
 }
@@ -364,14 +361,7 @@ pub struct DrawContext<'a> {
 }
 impl<'a> DrawContext<'a> {
 	pub fn logical_rect_to_viewport(&self, rect: &LogicalRect) -> Rect {
-		let dpi_scale = self.dpi_scale_factor;
-		let window_phys_height = self.viewport.height;
-		Rect {
-			left: (rect.pos.vec.x * dpi_scale) as u32,
-			width: (rect.size.vec.x * dpi_scale) as u32,
-			bottom: window_phys_height - (rect.bottom() * dpi_scale) as u32,
-			height: (rect.size.vec.y * dpi_scale) as u32,
-		}
+		physical_viewport_rect(rect, self.dpi_scale_factor, self.viewport.height)
 	}
 	pub fn clear_color(&self, target: &mut Frame, color: [f32; 4], rect: Option<LogicalRect>) {
 		// Rendering a quad to emulate clear.
@@ -403,14 +393,55 @@ impl<'a> DrawContext<'a> {
 			matrix: Into::<[[f32; 4]; 4]>::into(transform),
 			color: color,
 		};
-		target
-			.draw(
-				self.unit_quad_vertices,
-				self.unit_quad_indices,
-				self.colored_program,
-				&uniforms,
-				&image_draw_params,
-			)
-			.unwrap();
+		if let Err(e) = target.draw(
+			self.unit_quad_vertices,
+			self.unit_quad_indices,
+			self.colored_program,
+			&uniforms,
+			&image_draw_params,
+		) {
+			log::error!("Failed to draw a colored quad: {e}");
+		}
+	}
+}
+
+/// Converts a logical rect (origin at the top left) to a physical OpenGL rect (origin at the
+/// bottom left). Edges are rounded like `LogicalRect::align_to_pixels` so that scissor and
+/// viewport rects line up with what is drawn at fractional scale factors, and the result never
+/// underflows when the rect extends below the window.
+fn physical_viewport_rect(rect: &LogicalRect, dpi_scale: f32, window_phys_height: u32) -> Rect {
+	let left = (rect.pos.vec.x * dpi_scale).round() as u32;
+	let top = (rect.pos.vec.y * dpi_scale).round() as u32;
+	let width = (rect.size.vec.x * dpi_scale).round() as u32;
+	let height = (rect.size.vec.y * dpi_scale).round() as u32;
+	Rect {
+		left,
+		width,
+		bottom: window_phys_height.saturating_sub(top.saturating_add(height)),
+		height,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn rect(x: f32, y: f32, w: f32, h: f32) -> LogicalRect {
+		LogicalRect { pos: LogicalVector::new(x, y), size: LogicalVector::new(w, h) }
+	}
+
+	#[test]
+	fn viewport_rect_rounds_and_flips() {
+		// 1.5x scale: 10.3 * 1.5 = 15.45 -> 15, 20.2 * 1.5 = 30.3 -> 30
+		let r = physical_viewport_rect(&rect(10.3, 20.2, 100.0, 50.0), 1.5, 600);
+		assert_eq!((r.left, r.width, r.height, r.bottom), (15, 150, 75, 600 - 30 - 75));
+	}
+
+	#[test]
+	fn viewport_rect_does_not_underflow() {
+		let r = physical_viewport_rect(&rect(0.0, 90.0, 10.0, 50.0), 1.0, 100);
+		assert_eq!(r.bottom, 0);
+		let r = physical_viewport_rect(&rect(-5.0, -5.0, 10.0, 10.0), 1.0, 100);
+		assert_eq!((r.left, r.bottom), (0, 90));
 	}
 }

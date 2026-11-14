@@ -9,46 +9,64 @@ on:
 jobs:
 
   rustfmt-clippy:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          override: true
           components: rustfmt, clippy
-      - uses: actions/checkout@v2
-      - name: Run `cargo fmt`
-        uses: actions-rs/cargo@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxi-dev libgl1-mesa-dev libxkbcommon-dev libwayland-dev libgtk-3-dev libxdo-dev
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --features=networking -- -D warnings -A clippy::needless_late_init
+
+  clippy-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          command: fmt
-          args: --all -- --check
-      - name: Run `cargo clippy`
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: --all-targets --features=networking -- -D warnings -A clippy::needless_late_init
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --features=networking -- -D warnings -A clippy::needless_late_init
+
+  # The release workflow ships AVIF-enabled builds, so make sure they keep compiling.
+  # dav1d is built from source by dav1d-sys (same setup as release-packages.yml).
+  check-avif:
+    runs-on: ubuntu-24.04
+    env:
+      SYSTEM_DEPS_DAV1D_LINK: static
+      SYSTEM_DEPS_DAV1D_BUILD_INTERNAL: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxi-dev libgl1-mesa-dev libxkbcommon-dev libwayland-dev libgtk-3-dev libxdo-dev ninja-build nasm meson
+      - run: cargo check --workspace --all-targets --features=networking,avif
 
   build:
-    needs: rustfmt-clippy
+    needs: [rustfmt-clippy, clippy-macos]
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    env:
+      RUSTFLAGS: -C opt-level=0
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build and run tests (linux/macOS)
-        if: matrix.os != 'windows-latest'
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
         run: |
-          env RUSTFLAGS="-C opt-level=0" cargo test --verbose --features=networking
-
-      - name: Build and run tests (windows)
-        if: matrix.os == 'windows-latest'
-        shell: cmd
-        run: |
-          call "C:/Program Files (x86)/Microsoft Visual Studio/2019/Enterprise/VC/Auxiliary/Build/vcvars64.bat"
-          env RUSTFLAGS="-C opt-level=0" cargo test --verbose --features=networking
+          sudo apt-get update
+          sudo apt-get install -y libxi-dev libgl1-mesa-dev libxkbcommon-dev libwayland-dev libgtk-3-dev libxdo-dev
+      - name: Build and run tests
+        run: cargo test --verbose --workspace --features=networking

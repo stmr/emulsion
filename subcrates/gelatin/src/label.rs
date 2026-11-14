@@ -2,13 +2,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use cgmath::{Matrix4, Vector3};
-use glium::{uniform, Frame, Surface};
+use glium::{Frame, Surface, uniform};
 
+use crate::NextUpdate;
 use crate::add_common_widget_functions;
 use crate::misc::{Alignment, Length, LogicalRect, LogicalVector, WidgetPlacement};
 use crate::picture::Picture;
 use crate::window::RenderValidity;
-use crate::NextUpdate;
 use crate::{DrawContext, Event, Widget, WidgetData, WidgetError};
 
 struct LabelData {
@@ -110,7 +110,7 @@ impl Widget for Label {
 				let sampler = texture
 					.sampled()
 					.wrap_function(glium::uniforms::SamplerWrapFunction::Clamp)
-					.minify_filter(glium::uniforms::MinifySamplerFilter::Linear)
+					.minify_filter(glium::uniforms::MinifySamplerFilter::LinearMipmapLinear)
 					.magnify_filter(glium::uniforms::MagnifySamplerFilter::Linear);
 				let uniforms = uniform! {
 					matrix: Into::<[[f32; 4]; 4]>::into(transform),

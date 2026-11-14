@@ -1,24 +1,21 @@
-use std::io::Write;
 use std::marker::PhantomData;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use rand::rng;
 use rand::seq::SliceRandom;
-use rand::thread_rng;
 
-use log::{debug, trace};
+use log::{debug, error, trace};
 
-use gelatin::window::Window;
 use gelatin::Display;
+use gelatin::window::Window;
 
 use crate::image_cache::{
 	self, AnimationFrameTexture, ImageCache, PathResolutionError, PathedTextureResult,
 	TextureResult,
 };
-
-use image_cache::directory;
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 
@@ -38,7 +35,6 @@ pub enum PlaybackState {
 	Forward,
 	Present,
 	RandomPresent,
-	//Backward,
 }
 
 trait Playback: Sized {
@@ -134,48 +130,39 @@ impl Playback for AnimPlayback {
 	}
 
 	fn delay_nanos(player: &ImgSequencePlayer<Self>) -> u64 {
-		if let Some(ref frame) = player.image_texture {
-			frame.delay_nano
-		} else {
-			0
-		}
+		if let Some(ref frame) = player.image_texture { frame.delay_nano } else { 0 }
 	}
 }
 
 pub struct PlaybackManager {
-	//playback_state: PlaybackState,
 	image_cache: ImageCache,
 
-	// image_texture: Option<Rc<glium::texture::SrgbTexture2d>>,
-	// filename: Option<OsString>,
 	folder_player: ImgSequencePlayer<FolderPlayback>,
 	image_player: ImgSequencePlayer<AnimPlayback>,
+
+	/// A rescan of the folder was started and its result has not been acted on yet.
+	rescanning: bool,
 }
 
 impl PlaybackManager {
 	pub fn new() -> Self {
-		let cache_capaxity = match sys_info::mem_info() {
-			Ok(value) => {
-				// value originally reported in KiB
-				((value.total / 8) * 1024) as isize
-			}
-			_ => {
+		let cache_capaxity = match crate::system_memory::total_memory_bytes() {
+			Some(total) => (total / 8) as isize,
+			None => {
 				eprintln!("Could not get system memory size, using default value");
 				// bytes
 				500_000_000
 			}
 		};
 
-		let thread_count = match sys_info::cpu_num() {
-			Ok(value) => value.clamp(2, 4),
-			_ => 4,
-		};
+		let thread_count =
+			std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 4) as u32);
 
 		PlaybackManager {
-			//playback_state: PlaybackState::Paused,
 			image_cache: ImageCache::new(cache_capaxity, thread_count),
 			folder_player: ImgSequencePlayer::new(),
 			image_player: ImgSequencePlayer::new(),
+			rescanning: false,
 		}
 	}
 
@@ -185,66 +172,78 @@ impl PlaybackManager {
 
 	pub fn start_playback_forward(&mut self) {
 		self.folder_player.start_playback_forward();
-		// self.playback_start_time = Instant::now();
-		// self.frame_count_since_playback_start = 0;
-		// self.playback_state = PlaybackState::Forward;
 	}
 
 	pub fn pause_playback(&mut self) {
 		self.folder_player.pause_playback();
-		//self.playback_state = PlaybackState::Paused;
 	}
 
 	pub fn start_random_presentation(&mut self) {
 		self.folder_player.start_random_presentation(&mut self.image_cache);
-		//self.playback_start_time = Instant::now();
-		//self.frame_count_since_playback_start = 0;
-		//self.playback_state = PlaybackState::RandomPresent;
-		//self.fill_present_remainig_with_random();
 	}
 
 	pub fn start_presentation(&mut self) {
 		self.folder_player.start_presentation();
-		// self.playback_start_time = Instant::now();
-		// self.frame_count_since_playback_start = 0;
-		// self.playback_state = PlaybackState::Present;
 	}
 
-	/// Returns None when the folder hasn't finished filtering
+	/// Returns None while the very first folder is being listed
 	pub fn current_file_index(&mut self) -> Option<usize> {
 		self.image_cache.current_file_index()
 	}
 
-	/// Returns None when the folder hasn't finished filtering
+	/// Returns None while the very first folder is being listed
 	pub fn current_dir_len(&mut self) -> Option<usize> {
 		self.image_cache.current_dir_len()
 	}
 
-	pub fn update_directory(&mut self) -> directory::Result<()> {
+	pub fn path_by_index(&mut self, index: usize) -> Option<std::path::PathBuf> {
+		self.image_cache.path_by_index(index)
+	}
+
+	/// Starts listing the shown folder again in the background; `update_image` reloads the
+	/// current file when the listing arrives.
+	pub fn update_directory(&mut self) {
 		debug!("In `update_directory`");
 		if let LoadRequest::None = self.folder_player.load_request {
 			let curr_path = self.image_cache.current_file_path();
 			debug!("In `update_directory`, current_file_path is: {:?}", curr_path);
 			if curr_path.is_some() {
-				self.image_cache.update_directory()?;
-
-				// The there's no file to open, just request to open the empty path.
-				// This will hide the previously loaded image.
-				// Note that `image_cache.current_file_path()` is used instead of `self.shown_file_path()`
-				let path = self.image_cache.current_file_path().unwrap_or_default();
-				self.request_load(LoadRequest::FilePath(path));
+				self.image_cache.update_directory();
+				self.rescanning = true;
 			}
 		}
-		Ok(())
 	}
 
 	pub fn request_load(&mut self, request: LoadRequest) {
+		// Navigation has nothing to act on until the first folder is listed; it must not
+		// replace the request to open that folder.
+		if self.image_cache.current_dir_len().is_none()
+			&& !matches!(request, LoadRequest::FilePath(_))
+		{
+			return;
+		}
 		self.folder_player.request_load(request);
 		self.image_player.request_load(LoadRequest::Jump(0));
 	}
 
 	pub fn image_texture(&self) -> Option<AnimationFrameTexture> {
 		self.image_player.image_texture()
+	}
+
+	/// Tells the cache the area (physical pixels) SVGs are fitted to when they are loaded.
+	pub fn set_svg_view(&mut self, width: u32, height: u32) {
+		self.image_cache.set_svg_view(width, height);
+	}
+
+	/// Renders the shown SVG again to fit `fit` (physical pixels); `image_texture` keeps
+	/// returning the old render until the new one is ready. `false`: not possible right now.
+	pub fn rerender_svg(&mut self, fit: (u32, u32)) -> bool {
+		let started = self.image_cache.rerender_svg(fit);
+		if started {
+			// Makes the players poll for the new render.
+			self.request_load(LoadRequest::Jump(0));
+		}
+		started
 	}
 
 	/// The path to the image file which is currently rendered onto the screen.
@@ -254,6 +253,15 @@ impl PlaybackManager {
 
 	pub fn update_image(&mut self, window: &Window) -> gelatin::NextUpdate {
 		let display = window.display_mut();
+		if self.rescanning && !self.image_cache.listing_pending() {
+			self.rescanning = false;
+			if let LoadRequest::None = self.folder_player.load_request {
+				// The folder changed: show the file that is current now. If there is none, the
+				// empty path hides the previously loaded image.
+				let path = self.image_cache.current_file_path().unwrap_or_default();
+				self.request_load(LoadRequest::FilePath(path));
+			}
+		}
 		let prev_file = self.folder_player.image_texture();
 		let next_update = self.folder_player.update_image(&display, &mut self.image_cache);
 		trace!("Folder player next update: {:?}", next_update);
@@ -272,7 +280,13 @@ impl PlaybackManager {
 		let img_player_next_update =
 			self.image_player.update_image(&display, &mut self.image_cache);
 		trace!("Image player next update: {:?}", img_player_next_update);
-		next_update.aggregate(img_player_next_update)
+		let next_update = next_update.aggregate(img_player_next_update);
+		if self.rescanning {
+			// Keep polling for the folder listing.
+			let soon = Instant::now() + Duration::from_millis(50);
+			return next_update.aggregate(gelatin::NextUpdate::WaitUntil(soon));
+		}
+		next_update
 	}
 }
 
@@ -295,7 +309,6 @@ struct ImgSequencePlayer<P: Playback> {
 
 	last_frame_change_time: Instant,
 	frametime_drift_offset: i64, // in nanosecs
-	//frame_count_since_playback_start: u64,
 	load_request: LoadRequest,
 
 	image_texture: Option<AnimationFrameTexture>,
@@ -311,7 +324,6 @@ impl<P: Playback> ImgSequencePlayer<P> {
 			present_remaining: Vec::new(),
 			last_frame_change_time: Instant::now(),
 			frametime_drift_offset: 0,
-			//frame_count_since_playback_start: 0,
 			load_request: LoadRequest::None,
 			image_texture: None,
 			file_path: LoadedImgPath::NotYetLoaded,
@@ -327,7 +339,6 @@ impl<P: Playback> ImgSequencePlayer<P> {
 	pub fn start_playback_forward(&mut self) {
 		self.last_frame_change_time = Instant::now();
 		self.frametime_drift_offset = 0;
-		//self.frame_count_since_playback_start = 0;
 		self.playback_state = PlaybackState::Forward;
 	}
 
@@ -339,7 +350,6 @@ impl<P: Playback> ImgSequencePlayer<P> {
 	pub fn start_random_presentation(&mut self, image_cache: &mut ImageCache) -> bool {
 		self.last_frame_change_time = Instant::now();
 		self.frametime_drift_offset = 0;
-		//self.frame_count_since_playback_start = 0;
 		self.playback_state = PlaybackState::RandomPresent;
 		self.fill_present_remainig_with_random(image_cache)
 	}
@@ -347,7 +357,6 @@ impl<P: Playback> ImgSequencePlayer<P> {
 	pub fn start_presentation(&mut self) {
 		self.last_frame_change_time = Instant::now();
 		self.frametime_drift_offset = 0;
-		//self.frame_count_since_playback_start = 0;
 		self.playback_state = PlaybackState::Present;
 	}
 
@@ -366,8 +375,7 @@ impl<P: Playback> ImgSequencePlayer<P> {
 	) -> gelatin::NextUpdate {
 		trace!(
 			"Begin `update_image`. Curr image is: {:?}. Load request is {:?}",
-			self.file_path,
-			self.load_request
+			self.file_path, self.load_request
 		);
 		let is_paused = matches!(self.playback_state, PlaybackState::Paused);
 		let no_request = matches!(self.load_request, LoadRequest::None);
@@ -382,18 +390,14 @@ impl<P: Playback> ImgSequencePlayer<P> {
 		// function early. And at the same time I want to use it's value as it is at this line.
 		let mut load_request = LoadRequest::None;
 		mem::swap(&mut self.load_request, &mut load_request);
-		let frame_delta_time_nanos;
-		match self.playback_state {
-			PlaybackState::Present | PlaybackState::RandomPresent => {
-				frame_delta_time_nanos = (NANOS_PER_SEC * 6) as i64;
-			}
-			_ => {
-				frame_delta_time_nanos = P::delay_nanos(self) as i64;
-			}
+
+		let frame_delta_time_nanos = match self.playback_state {
+			PlaybackState::Present | PlaybackState::RandomPresent => (NANOS_PER_SEC * 6) as i64,
+			_ => P::delay_nanos(self) as i64,
 		};
 		if self.playback_state == PlaybackState::Paused {
 			if let Err(e) = image_cache.process_prefetched(display) {
-				eprintln!("Failed to process prefetched images with error '{:?}'", e);
+				error!("Failed to process prefetched images with error '{:?}'", e);
 			}
 			match load_request {
 				LoadRequest::Jump(0) => {
@@ -411,20 +415,21 @@ impl<P: Playback> ImgSequencePlayer<P> {
 			let elapsed_nanos = elapsed_nanos as i64 + self.frametime_drift_offset;
 
 			let nanos_til_next = frame_delta_time_nanos - elapsed_nanos;
-			let millis_til_next = nanos_til_next / 1_000_000;
-			next_update = gelatin::NextUpdate::WaitUntil(
-				now.checked_add(Duration::from_millis((millis_til_next / 2).max(1) as u64))
-					.unwrap(),
-			);
+			// Wake up exactly when the next frame is due. If it is already due without a frame
+			// step (zero frame delay) don't spin: look again shortly.
+			let wait = if nanos_til_next > 0 {
+				Duration::from_nanos(nanos_til_next as u64)
+			} else {
+				Duration::from_millis(1)
+			};
+			let next_frame_time = now.checked_add(wait).unwrap_or(few_millisecs_from_now);
+			next_update = gelatin::NextUpdate::WaitUntil(next_frame_time);
 			// This assumes that the following frames have the same delay but that's okay considering that
 			// if frame step is greater than 1 it almost certainly means that we couldn't load the
 			// next frame quiclky enough so there's not much else to do here.
-			let frame_step;
-			if frame_delta_time_nanos > 0 {
-				frame_step = elapsed_nanos / frame_delta_time_nanos;
-			} else {
-				frame_step = 0;
-			}
+
+			let frame_step =
+				if frame_delta_time_nanos > 0 { elapsed_nanos / frame_delta_time_nanos } else { 0 };
 			if frame_step > 0 {
 				load_request = match self.playback_state {
 					PlaybackState::Forward | PlaybackState::Present => {
@@ -454,20 +459,21 @@ impl<P: Playback> ImgSequencePlayer<P> {
 				self.last_frame_change_time = Instant::now();
 				self.frametime_drift_offset = -nanos_til_next;
 			} else {
-				image_cache.process_prefetched(display).unwrap();
-				const BUISY_WAIT_THRESHOLD: f32 = 0.8;
-				if elapsed_nanos > (frame_delta_time_nanos as f32 * BUISY_WAIT_THRESHOLD) as i64 {
-					// Just buisy wait if we are getting very close to the next frame swap
-					next_update = gelatin::NextUpdate::Soonest;
-				} else {
-					match self.playback_state {
-						PlaybackState::RandomPresent => {
-							if let Some(&last) = self.present_remaining.iter().last() {
-								image_cache.prefetch_at_index(last);
-							}
+				if let Err(e) = image_cache.process_prefetched(display) {
+					error!("Failed to process prefetched images with error '{:?}'", e);
+				}
+				match self.playback_state {
+					PlaybackState::RandomPresent => {
+						if let Some(&last) = self.present_remaining.iter().last() {
+							image_cache.prefetch_at_index(last);
 						}
-						_ => image_cache.prefetch_neighbors(),
 					}
+					_ => image_cache.prefetch_neighbors(),
+				}
+				if image_cache.has_pending_requests() {
+					// Keep polling so that finished prefetches get uploaded before the frame swap.
+					next_update =
+						gelatin::NextUpdate::WaitUntil(next_frame_time.min(few_millisecs_from_now));
 				}
 			}
 		} else {
@@ -506,17 +512,16 @@ impl<P: Playback> ImgSequencePlayer<P> {
 						self.load_request = LoadRequest::Jump(0);
 						next_update = gelatin::NextUpdate::WaitUntil(few_millisecs_from_now);
 					}
+					Err(image_cache::TextureError::WaitingOnListing) => {
+						// The folder of this file is being listed. Ask for the same file again
+						// (not the current one, which is still the previous folder's).
+						self.load_request = LoadRequest::FilePath(path);
+						next_update = gelatin::NextUpdate::WaitUntil(few_millisecs_from_now);
+					}
 					Err(err) => {
 						self.image_texture = None;
 						self.file_path = LoadedImgPath::ErrLoading(path);
-						let stderr = &mut ::std::io::stderr();
-						let stderr_errmsg = "Error writing to stderr";
-						writeln!(stderr, "Error occurred while loading image: {}", err)
-							.expect(stderr_errmsg);
-						// if let Some(backtrace) = err.backtrace() {
-						// 	writeln!(stderr, "backtrace: {:?}", backtrace).expect(stderr_errmsg);
-						// }
-						writeln!(stderr).expect(stderr_errmsg);
+						error!("Error occurred while loading image: {}", err);
 					}
 				},
 				Err(PathResolutionError::WaitingOnDirFilter) => {
@@ -540,7 +545,7 @@ impl<P: Playback> ImgSequencePlayer<P> {
 			for i in 0..dir_len {
 				self.present_remaining.push(i);
 			}
-			let mut rng = thread_rng();
+			let mut rng = rng();
 			self.present_remaining.as_mut_slice().shuffle(&mut rng);
 			true
 		} else {

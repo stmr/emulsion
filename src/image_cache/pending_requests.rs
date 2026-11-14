@@ -1,17 +1,20 @@
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::hash_map::Entry;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::image_loader::*;
 
 /// This struct is used in a map to determine the appropriate file when
 /// a load result comes in. (Load results identify the file with the request id only)
 /// See: `ImageCache::ongoing_requests`
-pub struct PendingRequestInfo {
-	//path: PathBuf,
-	cancelled: bool,
+struct PendingRequestInfo {
+	/// Shared with the loader: set once nobody wants the result any more.
+	cancelled: Arc<AtomicBool>,
 	finished: bool,
-	// mod_time: Option<SystemTime>,
+	/// Estimated size of the decoded image, counted against the cache capacity while the
+	/// request is in flight.
+	reserved: isize,
 
 	// I know that it would probably be faster to use a VecDeque and `drain` the elements
 	// instead of moving the entire vector in the `take_results` function.
@@ -20,22 +23,15 @@ pub struct PendingRequestInfo {
 	results: Vec<LoadResult>,
 }
 
-impl PendingRequestInfo {
-	pub fn cancel(&mut self) {
-		self.cancelled = true;
-	}
-}
-
 pub struct PendingRequests {
 	/// Keeps track of all requests that have been sent
 	/// but for which no response has been received
 	by_id: HashMap<u32, PendingRequestInfo>,
-	path_to_id: HashMap<PathBuf, u32>,
 }
 
 impl PendingRequests {
 	pub fn new() -> Self {
-		PendingRequests { by_id: HashMap::new(), path_to_id: HashMap::new() }
+		PendingRequests { by_id: HashMap::new() }
 	}
 
 	pub fn take_results(&mut self, id: u32) -> Option<Vec<LoadResult>> {
@@ -58,16 +54,8 @@ impl PendingRequests {
 		self.by_id.keys().copied().collect()
 	}
 
-	pub fn cancelled(&self, id: &u32) -> Option<bool> {
-		self.get(id).map(|i| i.cancelled)
-	}
-
 	pub fn contains(&self, id: &u32) -> bool {
-		if let Some(info) = self.by_id.get(id) {
-			!info.finished
-		} else {
-			false
-		}
+		if let Some(info) = self.by_id.get(id) { !info.finished } else { false }
 	}
 
 	pub fn set_finished(&mut self, id: &u32) {
@@ -84,38 +72,74 @@ impl PendingRequests {
 		self.iter().count()
 	}
 
-	/// Returns true if the result was appended to a pending request.
-	/// Returns false otherwise.
+	/// Results of requests that are no longer tracked are dropped.
 	pub fn add_load_result(&mut self, load_result: LoadResult) {
 		if let Some(info) = self.by_id.get_mut(&load_result.req_id()) {
 			info.results.push(load_result);
-		} else {
-			unreachable!()
 		}
 	}
 
-	pub fn add_request(&mut self, request: LoadRequest) {
-		self.path_to_id.insert(request.path.clone(), request.req_id);
+	pub fn add_request(&mut self, request: &LoadRequest, reserved: isize) {
 		self.by_id.insert(
 			request.req_id,
 			PendingRequestInfo {
-				cancelled: false,
-				//path: request.path,
+				cancelled: request.cancelled.clone(),
 				finished: false,
+				reserved,
 				results: Vec::with_capacity(3),
 			},
 		);
 	}
 
-	pub fn get(&self, id: &u32) -> Option<&PendingRequestInfo> {
-		self.by_id.get(id).filter(|i| !i.finished)
+	/// Memory estimate of the requests that are still decoding and will be uploaded.
+	pub fn reserved_total(&self) -> isize {
+		self.iter().map(|(_, info)| info.reserved).sum()
 	}
 
-	pub fn iter_mut(&mut self) -> impl Iterator<Item = (&u32, &mut PendingRequestInfo)> {
-		self.by_id.iter_mut().filter(|(_, i)| !i.finished)
+	/// Forgets the requests `keep` rejects and tells the loader to stop decoding them. Their
+	/// slot and memory reservation are free at once; results that still arrive are dropped.
+	pub fn retain(&mut self, mut keep: impl FnMut(u32) -> bool) {
+		self.by_id.retain(|&id, info| {
+			let keep = keep(id);
+			if !keep {
+				info.cancelled.store(true, Ordering::Relaxed);
+			}
+			keep
+		});
 	}
 
-	pub fn iter(&self) -> impl Iterator<Item = (&u32, &PendingRequestInfo)> {
+	/// True if there is anything left to receive or upload.
+	pub fn has_work(&self) -> bool {
+		!self.by_id.is_empty()
+	}
+
+	fn iter(&self) -> impl Iterator<Item = (&u32, &PendingRequestInfo)> {
 		self.by_id.iter().filter(|(_, i)| !i.finished)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A cancelled request frees its slot and reservation right away and the loader is told.
+	#[test]
+	fn retain_cancels_rejected_requests() {
+		let mut pending = PendingRequests::new();
+		let kept = LoadRequest::new(1, "a".into(), true);
+		let dropped = LoadRequest::new(2, "b".into(), false);
+		pending.add_request(&kept, 10);
+		pending.add_request(&dropped, 100);
+		assert_eq!((pending.len(), pending.reserved_total()), (2, 110));
+
+		pending.retain(|id| id == 1);
+		assert_eq!((pending.len(), pending.reserved_total()), (1, 10));
+		assert!(!kept.cancelled.load(Ordering::Relaxed));
+		assert!(dropped.cancelled.load(Ordering::Relaxed));
+		assert!(!pending.contains(&2));
+
+		// A late result of the cancelled request is dropped, not tracked again.
+		pending.add_load_result(LoadResult::Done { req_id: 2, truncated: false });
+		assert!(pending.take_results(2).is_none());
 	}
 }

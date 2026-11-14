@@ -1,15 +1,15 @@
 use std::path::PathBuf;
 use std::sync::{
-	atomic::{AtomicBool, Ordering},
 	Arc, Condvar, Mutex,
+	atomic::{AtomicBool, Ordering},
 };
 
 use gelatin::image::imageops::{
-	flip_horizontal_in_place, flip_vertical_in_place, rotate180_in_place, rotate270, rotate90,
+	flip_horizontal_in_place, flip_vertical_in_place, rotate90, rotate180_in_place, rotate270,
 };
 
 use crate::image_cache::image_loader::{
-	complex_load_image, ImageLoaderError, LoadResult, Orientation,
+	ImageLoaderError, LoadResult, Orientation, complex_load_image,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -64,7 +64,12 @@ impl ClipboardHandler {
 	}
 
 	fn request_stop_thread(&self) {
-		self.request_handle.run_thread.store(false, Ordering::Release);
+		// The flag flips under the mutex the worker holds while checking it, so the worker
+		// cannot miss the notification between its check and going to sleep.
+		{
+			let _state = self.request_handle.state.lock().unwrap_or_else(|e| e.into_inner());
+			self.request_handle.run_thread.store(false, Ordering::Release);
+		}
 		self.request_handle.condvar.notify_one();
 	}
 
@@ -106,9 +111,11 @@ impl ClipboardHandler {
 					}
 				}
 			}
-			let result = complex_load_image(&request_path, false, 0, |frame| {
-				if let LoadResult::Frame { mut image, orientation, .. } = frame {
-					if let Ok(clipboard) = &mut clipboard {
+			let ok = clipboard.is_ok()
+				&& complex_load_image(&request_path, false, 0, |frame| {
+					if let LoadResult::Frame { mut image, orientation, .. } = frame
+						&& let Ok(clipboard) = &mut clipboard
+					{
 						// Note: the imageops functions use clockwise rotation whereas the
 						// `Orientation` type describes counter-clockwise rotation.
 						image = match orientation {
@@ -120,6 +127,7 @@ impl ClipboardHandler {
 							Orientation::Deg90 => rotate270(&image),
 							Orientation::Deg90VerFlip => {
 								let mut result = rotate270(&image);
+								drop(image);
 								flip_vertical_in_place(&mut result);
 								result
 							}
@@ -135,6 +143,7 @@ impl ClipboardHandler {
 							Orientation::Deg270 => rotate90(&image),
 							Orientation::Deg270VerFlip => {
 								let mut result = rotate90(&image);
+								drop(image);
 								flip_vertical_in_place(&mut result);
 								result
 							}
@@ -151,12 +160,13 @@ impl ClipboardHandler {
 							return Ok(());
 						}
 					}
-				}
-				Err(ImageLoaderError { description: "Could not set the clipboard image.".into() })
-			});
+					Err(ImageLoaderError {
+						description: "Could not set the clipboard image.".into(),
+					})
+				})
+				.is_ok();
 			let mut state = request_handle.state.lock().unwrap();
-			*state =
-				if result.is_ok() { ClipboardState::Succeeded } else { ClipboardState::Failed };
+			*state = if ok { ClipboardState::Succeeded } else { ClipboardState::Failed };
 		}
 	}
 }
@@ -171,7 +181,7 @@ impl Drop for ClipboardHandler {
 	fn drop(&mut self) {
 		if let Some(handle) = self.thread_handle.take() {
 			self.request_stop_thread();
-			handle.join().unwrap();
+			let _ = handle.join();
 		}
 	}
 }

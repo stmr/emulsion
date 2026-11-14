@@ -3,13 +3,13 @@ use std::rc::Rc;
 
 use gelatin::cgmath::{Matrix4, Vector3};
 
-use gelatin::glium::{uniform, Frame, Surface};
+use gelatin::glium::{Frame, Surface, uniform};
 
+use gelatin::NextUpdate;
 use gelatin::add_common_widget_functions;
 use gelatin::misc::{Alignment, Length, LogicalRect, LogicalVector, WidgetPlacement};
 use gelatin::picture::Picture;
 use gelatin::window::RenderValidity;
-use gelatin::NextUpdate;
 use gelatin::{DrawContext, Event, Widget, WidgetData, WidgetError};
 
 struct HelpScreenData {
@@ -105,7 +105,7 @@ impl Widget for HelpScreen {
 					&uniforms,
 					&image_draw_params,
 				)
-				.unwrap();
+				.unwrap_or_else(|error| log::error!("Could not draw the help overlay: {error}"));
 
 			///////////////////////////////////////////////////////////////////////////
 			// Draw Help Image
@@ -125,7 +125,7 @@ impl Widget for HelpScreen {
 			let sampler = texture
 				.sampled()
 				.wrap_function(gelatin::glium::uniforms::SamplerWrapFunction::Clamp)
-				.minify_filter(gelatin::glium::uniforms::MinifySamplerFilter::Linear)
+				.minify_filter(gelatin::glium::uniforms::MinifySamplerFilter::LinearMipmapLinear)
 				.magnify_filter(gelatin::glium::uniforms::MagnifySamplerFilter::Linear);
 			let uniforms = uniform! {
 				matrix: Into::<[[f32; 4]; 4]>::into(transform),
@@ -145,7 +145,7 @@ impl Widget for HelpScreen {
 					&uniforms,
 					&image_draw_params,
 				)
-				.unwrap();
+				.unwrap_or_else(|error| log::error!("Could not draw the help image: {error}"));
 			//////////////////////////////////////////////////////////////////////////
 
 			//let uniforms
@@ -160,15 +160,19 @@ impl Widget for HelpScreen {
 		}
 		if !borrowed.initiaizlied {
 			borrowed.initiaizlied = true;
-			let img_data = borrowed.usage_image.get_metadata().unwrap();
-			borrowed.placement = WidgetPlacement {
-				width: Length::Fixed(img_data.width as f32 * 0.5),
-				height: Length::Fixed(img_data.height as f32 * 0.5),
-				horizontal_align: Alignment::Center,
-				vertical_align: Alignment::Center,
-				ignore_layout: true,
-				..Default::default()
-			};
+			match borrowed.usage_image.get_metadata() {
+				Ok(img_data) => {
+					borrowed.placement = WidgetPlacement {
+						width: Length::Fixed(img_data.width as f32 * 0.5),
+						height: Length::Fixed(img_data.height as f32 * 0.5),
+						horizontal_align: Alignment::Center,
+						vertical_align: Alignment::Center,
+						ignore_layout: true,
+						..Default::default()
+					};
+				}
+				Err(error) => log::error!("Could not read the help image metadata: {error}"),
+			}
 		}
 		borrowed.default_layout(available_space);
 		borrowed.parent_space = available_space;

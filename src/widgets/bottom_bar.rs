@@ -1,16 +1,22 @@
 use super::picture_widget::ScalingMode;
-use crate::{ConfigWindowSection, Configuration, Theme};
+use crate::{
+	Configuration, Theme,
+	configuration::{GAMMA_SLIDER_STEPS, clamp_gamma, gamma_to_slider_position},
+};
 
 use gelatin::{
+	NextUpdate,
 	button::Button,
 	line_layout_container::HorizontalLayoutContainer,
 	misc::{Alignment, Length},
 	picture::Picture,
 	slider::Slider,
 };
-use std::f32;
-use std::rc::Rc;
-
+use std::{
+	cell::Cell,
+	rc::Rc,
+	time::{Duration, Instant},
+};
 static MOON: &[u8] = include_bytes!("../../resource/moon.png");
 static LIGHT: &[u8] = include_bytes!("../../resource/light.png");
 static QUESTION_BUTTON: &[u8] = include_bytes!("../../resource/question_button.png");
@@ -22,6 +28,27 @@ static ONE_LIGHT: &[u8] = include_bytes!("../../resource/1-light.png");
 static FIT_STRETCH: &[u8] = include_bytes!("../../resource/fit-stretch.png");
 static FIT_STRETCH_LIGHT: &[u8] = include_bytes!("../../resource/fit-stretch-light.png");
 static FIT_BEST: &[u8] = include_bytes!("../../resource/fit-min.png");
+
+const BOTTOM_EDGE_REVEAL_DISTANCE: f32 = 24.0;
+const BOTTOM_BAR_HIDE_DELAY: Duration = Duration::from_millis(800);
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum VisibilityPolicy {
+	Hidden,
+	AutoHide,
+	Pinned,
+}
+
+impl VisibilityPolicy {
+	fn from_config(config: &Configuration) -> Self {
+		match config.window.as_ref().and_then(|window| window.show_bottom_bar) {
+			Some(false) => Self::Hidden,
+			Some(true) => Self::Pinned,
+			None => Self::AutoHide,
+		}
+	}
+}
+
 static FIT_BEST_LIGHT: &[u8] = include_bytes!("../../resource/fit-min-light.png");
 
 const NO_BG_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
@@ -30,6 +57,7 @@ const ACTIVE_BG_COLOR: [f32; 4] = [0.3, 0.3, 0.3, 0.5];
 const SMALL_BUTTON_GAP: f32 = 4.0;
 const BIG_BUTTON_GAP: f32 = 32.0;
 const BUTTON_SIZE: f32 = 24.0;
+pub const BOTTOM_BAR_HEIGHT: f32 = 32.0;
 
 pub struct BottomBar {
 	pub widget: Rc<HorizontalLayoutContainer>,
@@ -37,12 +65,14 @@ pub struct BottomBar {
 	pub fit_stretch_button: Rc<Button>,
 	pub fit_best_button: Rc<Button>,
 	pub slider: Rc<Slider>,
+	pub gamma_slider: Rc<Slider>,
 	pub theme_button: Rc<Button>,
 	pub help_button: Rc<Button>,
 
-	/// This is false if the configuration requires this to be invisible
-	// and true otherwise.
-	pub should_show: bool,
+	pub visibility_policy: VisibilityPolicy,
+	hide_at: Cell<Option<Instant>>,
+	is_fullscreen: Cell<bool>,
+	is_visible: Cell<bool>,
 
 	question: Rc<Picture>,
 	question_light: Rc<Picture>,
@@ -78,34 +108,39 @@ impl BottomBar {
 		widget.set_margin_right(0.0);
 		widget.set_height(Length::Fixed(32.0));
 		widget.set_width(Length::Stretch { min: 0.0, max: f32::INFINITY });
+		widget.set_ignore_layout(true);
+		widget.set_vertical_align(Alignment::End);
 
 		let orig_scale_button = make_icon_button(Alignment::Start);
 		let fit_best_button = make_icon_button(Alignment::Start);
 		let fit_stretch_button = make_icon_button(Alignment::Start);
 		let slider = make_slider();
+		let gamma_slider = make_gamma_slider();
 		let theme_button = make_icon_button(Alignment::End);
 		let help_button = make_icon_button(Alignment::End);
 
 		orig_scale_button.set_margin_left(SMALL_BUTTON_GAP);
 		fit_stretch_button.set_margin_right(SMALL_BUTTON_GAP);
+		gamma_slider.set_margin_right(SMALL_BUTTON_GAP);
 		theme_button.set_margin_left(SMALL_BUTTON_GAP);
 		help_button.set_margin_left(SMALL_BUTTON_GAP);
 		help_button.set_margin_right(SMALL_BUTTON_GAP);
 
+		if let Some(gamma) = config.image.as_ref().and_then(|image| image.gamma) {
+			gamma_slider.set_value(gamma_to_slider_position(clamp_gamma(gamma)));
+		}
+
 		widget.add_child(orig_scale_button.clone());
 		widget.add_child(fit_best_button.clone());
 		widget.add_child(fit_stretch_button.clone());
+		widget.add_child(gamma_slider.clone());
 		widget.add_child(slider.clone());
 		widget.add_child(theme_button.clone());
 		widget.add_child(help_button.clone());
 
-		let should_show;
-		if let Some(ConfigWindowSection { show_bottom_bar: Some(false), .. }) = config.window {
-			widget.set_visible(false);
-			should_show = false;
-		} else {
-			should_show = true;
-		}
+		let visibility_policy = VisibilityPolicy::from_config(config);
+		let is_visible = visibility_policy == VisibilityPolicy::Pinned;
+		widget.set_visible(is_visible);
 
 		Self {
 			widget,
@@ -113,9 +148,13 @@ impl BottomBar {
 			fit_stretch_button,
 			fit_best_button,
 			slider,
+			gamma_slider,
 			theme_button,
 			help_button,
-			should_show,
+			visibility_policy,
+			hide_at: Cell::new(None),
+			is_fullscreen: Cell::new(false),
+			is_visible: Cell::new(is_visible),
 
 			question,
 			question_light,
@@ -165,10 +204,77 @@ impl BottomBar {
 		}
 	}
 
-	/// Sets this visible iff both the `visible` parameter is `true` and
-	/// the `should_show` property of this object is `true`
-	pub fn set_visible_if_should_show(&self, visible: bool) {
-		self.widget.set_visible(visible && self.should_show);
+	pub fn set_gamma_slider_value(&self, gamma: f32) {
+		self.gamma_slider.set_value(gamma_to_slider_position(clamp_gamma(gamma)));
+	}
+
+	pub fn set_fullscreen(&self, fullscreen: bool) {
+		self.is_fullscreen.set(fullscreen);
+		self.hide_at.set(None);
+		match self.visibility_policy {
+			VisibilityPolicy::Hidden | VisibilityPolicy::AutoHide if fullscreen => {
+				self.set_widget_visible(false);
+			}
+			VisibilityPolicy::Hidden | VisibilityPolicy::AutoHide => {
+				self.set_widget_visible(false);
+			}
+			VisibilityPolicy::Pinned => {
+				self.set_widget_visible(!fullscreen);
+			}
+		}
+	}
+
+	pub fn handle_pointer_move(&self, cursor_y: f32, window_height: f32) {
+		let at_bottom_edge = cursor_y >= (window_height - BOTTOM_EDGE_REVEAL_DISTANCE).max(0.0);
+		match self.visibility_policy {
+			VisibilityPolicy::Hidden | VisibilityPolicy::Pinned => {
+				self.hide_at.set(None);
+			}
+			VisibilityPolicy::AutoHide if self.is_fullscreen.get() => {
+				self.hide_at.set(None);
+				self.set_widget_visible(false);
+			}
+			VisibilityPolicy::AutoHide if at_bottom_edge => {
+				self.hide_at.set(None);
+				self.set_widget_visible(true);
+			}
+			VisibilityPolicy::AutoHide => {
+				if self.is_visible.get() {
+					self.hide_at.set(Some(Instant::now() + BOTTOM_BAR_HIDE_DELAY));
+				}
+			}
+		}
+	}
+
+	pub fn is_bar_visible(&self) -> bool {
+		self.is_visible.get()
+	}
+
+	pub fn before_draw(&self) -> NextUpdate {
+		if self.visibility_policy != VisibilityPolicy::AutoHide
+			|| self.is_fullscreen.get()
+			|| !self.is_visible.get()
+		{
+			return NextUpdate::Latest;
+		}
+		if let Some(hide_at) = self.hide_at.get() {
+			let now = Instant::now();
+			if now >= hide_at {
+				self.hide_at.set(None);
+				self.set_widget_visible(false);
+				NextUpdate::Latest
+			} else {
+				NextUpdate::WaitUntil(hide_at)
+			}
+		} else {
+			NextUpdate::Latest
+		}
+	}
+
+	fn set_widget_visible(&self, visible: bool) {
+		if self.is_visible.replace(visible) != visible {
+			self.widget.set_visible(visible);
+		}
 	}
 
 	pub fn set_help_visible(&self, visible: bool) {
@@ -219,5 +325,15 @@ fn make_slider() -> Rc<Slider> {
 	slider.set_width(Length::Stretch { min: 0.0, max: f32::INFINITY });
 	slider.set_horizontal_align(Alignment::Center);
 	slider.set_steps(6, 1);
+	slider
+}
+
+fn make_gamma_slider() -> Rc<Slider> {
+	let slider = Rc::new(Slider::new());
+	slider.set_margin_top(SMALL_BUTTON_GAP);
+	slider.set_width(Length::Fixed(128.0));
+	slider.set_height(Length::Fixed(BUTTON_SIZE));
+	slider.set_horizontal_align(Alignment::Start);
+	slider.set_steps(GAMMA_SLIDER_STEPS, GAMMA_SLIDER_STEPS / 2);
 	slider
 }
