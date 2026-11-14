@@ -3,15 +3,15 @@ use std::rc::Rc;
 
 use glium::Frame;
 
+use crate::NextUpdate;
 use crate::misc::{
 	Alignment, HorDim, Length, LogicalRect, LogicalVector, PickDimension, VerDim, WidgetPlacement,
 };
 use crate::window::RenderValidity;
 use crate::window::Window;
-use crate::NextUpdate;
 use crate::{
-	add_common_widget_functions, widget_data_ptr, DrawContext, Event, Widget, WidgetData,
-	WidgetError,
+	DrawContext, Event, Widget, WidgetData, WidgetError, add_common_widget_functions,
+	widget_data_ptr,
 };
 
 pub type HorizontalLayoutContainer = LineLayoutContainer<HorDim>;
@@ -99,13 +99,6 @@ impl<Dim: PickDimension + 'static> LineLayoutContainer<Dim> {
 			}
 		}
 		borrowed.children.push(new_child);
-		borrowed.render_validity.invalidate();
-	}
-
-	pub fn remove_child(&self, target: Rc<dyn Widget>) {
-		let mut borrowed = self.data.borrow_mut();
-		let target_ptr = widget_data_ptr(&target);
-		borrowed.children.retain(|child| target_ptr != widget_data_ptr(child));
 		borrowed.render_validity.invalidate();
 	}
 

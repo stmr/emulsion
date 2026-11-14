@@ -4,10 +4,6 @@ use winit::dpi;
 use std::ops::{Add, AddAssign, Div, Mul, Sub};
 
 /// Used to represent logical pixel coordinates and dimensions.
-///
-/// This struct is distinct from `PhysicalVector` which represents
-/// physical pixel coordinates and dimensions to avoid
-/// confusion when dealing with scaled dpi scenarios.
 #[derive(Copy, Clone, Debug)]
 pub struct LogicalVector {
 	pub vec: Vector2<f32>,
@@ -126,7 +122,7 @@ impl LogicalRect {
 	}
 	#[inline]
 	pub fn center(&self) -> LogicalVector {
-		self.pos + self.size * 0.5
+		self.pos + self.size * 0.5_f32
 	}
 	pub fn contains(&self, point: LogicalVector) -> bool {
 		point.vec.x > self.pos.vec.x
@@ -182,16 +178,6 @@ pub struct WidgetPlacement {
 	pub margin_top: f32,
 	pub margin_bottom: f32,
 }
-
-/// Used to represent physical pixel coordinates and dimensions.
-///
-/// See `LogicalVector`
-#[derive(Copy, Clone, Debug)]
-pub struct PhysicalVector {
-	pub vec: Vector2<f32>,
-}
-
-// TODO implement stuff for physical vector
 
 pub trait PickDimension {
 	fn vec_mut(v: &mut LogicalVector) -> &mut f32;

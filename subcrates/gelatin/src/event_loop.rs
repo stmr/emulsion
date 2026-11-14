@@ -7,6 +7,9 @@ use crate::{
 
 use winit::event_loop::EventLoop as WinitEventLoop;
 
+#[cfg(target_os = "macos")]
+use winit::platform::macos::EventLoopBuilderExtMacOS;
+
 pub struct EventLoop<UserEvent: Debug + 'static> {
 	pub(crate) inner: winit::event_loop::EventLoop<UserEvent>,
 }
@@ -16,7 +19,10 @@ where
 	UserEvent: Debug + 'static,
 {
 	pub fn new() -> Self {
-		Self { inner: WinitEventLoop::<UserEvent>::with_user_event().build().unwrap() }
+		let mut builder = WinitEventLoop::<UserEvent>::with_user_event();
+		#[cfg(target_os = "macos")]
+		builder.with_default_menu(false);
+		Self { inner: builder.build().unwrap() }
 	}
 
 	pub fn create_proxy(&self) -> winit::event_loop::EventLoopProxy<UserEvent> {

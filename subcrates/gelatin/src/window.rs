@@ -1,7 +1,6 @@
-#![allow(unexpected_cfgs)]
-
 use cgmath::{Matrix4, Vector3};
 use glium::{
+	Blend, BlendingFunction, Display, Frame, IndexBuffer, Program, Rect, Surface, VertexBuffer,
 	glutin::{
 		self,
 		config::{Api, ConfigSurfaceTypes, GlConfig},
@@ -9,8 +8,7 @@ use glium::{
 		display::{GetGlDisplay, GlDisplay},
 		surface::{GlSurface, WindowSurface},
 	},
-	uniform, Blend, BlendingFunction, Display, Frame, IndexBuffer, Program, Rect, Surface,
-	VertexBuffer,
+	uniform,
 };
 use log::{debug, error, warn};
 use raw_window_handle::HasWindowHandle;
@@ -22,11 +20,13 @@ use winit::{
 	window::{CursorIcon, Fullscreen, Icon, WindowAttributes, WindowId},
 };
 
-#[cfg(x11_platform)]
-use winit::platform::x11::WindowBuilderExtX11;
-
-#[cfg(wayland_platform)]
-use winit::platform::wayland::{EventLoopWindowTargetExtWayland, WindowBuilderExtWayland};
+#[cfg(target_os = "macos")]
+use winit::platform::macos::WindowAttributesExtMacOS;
+#[cfg(free_unix)]
+use winit::platform::{
+	wayland::{ActiveEventLoopExtWayland, WindowAttributesExtWayland},
+	x11::{ActiveEventLoopExtX11, WindowAttributesExtX11},
+};
 
 use std::{
 	cell::{Cell, RefCell, RefMut},
@@ -43,12 +43,12 @@ use derive_builder::Builder;
 
 use crate::shaders;
 use crate::{
-	application::Application,
-	shaders::{shader_from_source, ShaderDescriptor},
+	DrawContext, Event, EventKind, NextUpdate, Vertex, Widget,
+	misc::{FromPhysical, LogicalRect, LogicalVector},
 };
 use crate::{
-	misc::{FromPhysical, LogicalRect, LogicalVector},
-	DrawContext, Event, EventKind, NextUpdate, Vertex, Widget,
+	application::Application,
+	shaders::{ShaderDescriptor, shader_from_source},
 };
 
 const EVENT_UPDATE_DELTA: std::time::Duration = std::time::Duration::from_millis(2);
@@ -140,11 +140,31 @@ pub struct WindowDescriptor {
 	#[builder(default)]
 	pub position: Option<PhysicalPosition<i32>>,
 
-	/// Only relevant on Wayland.
-	/// See: https://docs.rs/winit/0.24.0/winit/platform/unix/trait.WindowBuilderExtUnix.html#tymethod.with_app_id
+	/// Wayland `app_id` / X11 `WM_CLASS` general name. Ignored on other platforms.
 	#[builder(default)]
-	#[allow(dead_code)]
 	pub app_id: Option<String>,
+
+	/// Allow the content view to extend into the macOS title bar.
+	///
+	/// This is ignored on platforms other than macOS. Pair it with
+	/// [`titlebar_transparent`](Self::titlebar_transparent) and
+	/// [`title_hidden`](Self::title_hidden) to keep the native traffic lights
+	/// while drawing content behind the title bar.
+	#[builder(default)]
+	pub fullsize_content_view: bool,
+
+	/// Make the macOS title bar transparent.
+	///
+	/// This is ignored on platforms other than macOS. The native title bar
+	/// buttons remain available.
+	#[builder(default)]
+	pub titlebar_transparent: bool,
+
+	/// Hide the macOS title text without hiding the native title bar buttons.
+	///
+	/// This is ignored on platforms other than macOS.
+	#[builder(default)]
+	pub title_hidden: bool,
 }
 
 pub type EventHandler = dyn FnMut(&Window, &WindowEvent);
@@ -160,6 +180,9 @@ struct WindowData {
 	last_event_invalidated: bool,
 
 	new_title: Option<String>,
+	/// The last title passed to `set_title`; used to skip redundant updates.
+	title: String,
+	is_wayland: bool,
 
 	render_validity: RenderValidity,
 	cursor_pos: LogicalVector,
@@ -201,11 +224,15 @@ impl Window {
 	) -> Result<Rc<Self>, Box<dyn std::error::Error>> {
 		const MINIMUM_WINDOW_SIZE: u32 = 200;
 		if desc.size.width < MINIMUM_WINDOW_SIZE {
-			warn!("Window width was specified to be zero. Defaulting to {MINIMUM_WINDOW_SIZE} instead");
+			warn!(
+				"Window width was specified to be zero. Defaulting to {MINIMUM_WINDOW_SIZE} instead"
+			);
 			desc.size.width = MINIMUM_WINDOW_SIZE;
 		}
 		if desc.size.height < MINIMUM_WINDOW_SIZE {
-			warn!("Window height was specified to be zero. Defaulting to {MINIMUM_WINDOW_SIZE} instead");
+			warn!(
+				"Window height was specified to be zero. Defaulting to {MINIMUM_WINDOW_SIZE} instead"
+			);
 			desc.size.height = MINIMUM_WINDOW_SIZE;
 		}
 
@@ -233,62 +260,52 @@ impl Window {
 				}
 			}
 		}
+		#[cfg(target_os = "macos")]
+		{
+			window_attributes = window_attributes
+				.with_fullsize_content_view(desc.fullsize_content_view)
+				.with_titlebar_transparent(desc.titlebar_transparent)
+				.with_title_hidden(desc.title_hidden);
+		}
 
-		#[cfg(any(x11_platform, wayland_platform))]
-		let window_attributes = if let Some(app_id) = desc.app_id {
-			let is_wayland = std::env::var("XDG_SESSION_TYPE")
-				.map_or(false, |var| var.to_lowercase().contains("wayland"));
+		#[cfg(free_unix)]
+		let is_wayland = event_loop.is_wayland();
+		#[cfg(not(free_unix))]
+		let is_wayland = false;
 
-			if is_wayland {
-				let result;
-				#[cfg(wayland_platform)]
-				result = WindowAttributesExtWayland::with_name(
-					window_attributes,
-					&app_id,
-					app_id.to_lowercase(),
-				);
-				#[cfg(not(wayland_platform))]
-				result = window_attributes;
-				result
-			} else {
-				let result;
-				#[cfg(x11_platform)]
-				result = WindowAttributesExtX11::with_name(
-					window_attributes,
-					&app_id,
-					app_id.to_lowercase(),
-				);
-				#[cfg(not(x11_platform))]
-				result = window_attributes;
-				result
+		#[cfg(free_unix)]
+		{
+			if let Some(app_id) = &desc.app_id {
+				let instance = app_id.to_lowercase();
+				window_attributes = if is_wayland {
+					WindowAttributesExtWayland::with_name(window_attributes, app_id, instance)
+				} else if event_loop.is_x11() {
+					WindowAttributesExtX11::with_name(window_attributes, app_id, instance)
+				} else {
+					window_attributes
+				};
 			}
-		} else {
-			window_attributes
-		};
+		}
 
-		// let window = window.build(&application.event_loop).unwrap();
-		let (window, display) = Self::build_winit_window(window_attributes, event_loop);
+		let (window, display) = Self::build_winit_window(window_attributes, event_loop)?;
 
 		window.set_cursor(CursorIcon::Default);
 
 		// All the draw stuff
 		use glium::index::PrimitiveType;
-		let vertex_buffer = {
-			VertexBuffer::new(
-				&display,
-				&[
-					Vertex { position: [0.0, 0.0], tex_coords: [0.0, 0.0] },
-					Vertex { position: [0.0, 1.0], tex_coords: [0.0, 1.0] },
-					Vertex { position: [1.0, 1.0], tex_coords: [1.0, 1.0] },
-					Vertex { position: [1.0, 0.0], tex_coords: [1.0, 0.0] },
-				],
-			)
-			.unwrap()
-		};
+		let vertex_buffer = VertexBuffer::new(
+			&display,
+			&[
+				Vertex { position: [0.0, 0.0], tex_coords: [0.0, 0.0] },
+				Vertex { position: [0.0, 1.0], tex_coords: [0.0, 1.0] },
+				Vertex { position: [1.0, 1.0], tex_coords: [1.0, 1.0] },
+				Vertex { position: [1.0, 0.0], tex_coords: [1.0, 0.0] },
+			],
+		)?;
 
 		// building the index buffer
 		let index_buffer =
-			IndexBuffer::new(&display, PrimitiveType::TriangleStrip, &[1_u16, 2, 0, 3]).unwrap();
+			IndexBuffer::new(&display, PrimitiveType::TriangleStrip, &[1_u16, 2, 0, 3])?;
 
 		// compiling shaders and linking them together
 		let textured_program = shader_from_source(
@@ -297,10 +314,8 @@ impl Window {
 				vertex_shader: shaders::VERTEX_140,
 				fragment_shader: shaders::TEXTURE_SHADOW_F_140,
 				outputs_srgb: false,
-				..Default::default()
 			},
-		)
-		.unwrap();
+		)?;
 
 		let colored_shadowed_program = shader_from_source(
 			&display,
@@ -308,10 +323,8 @@ impl Window {
 				vertex_shader: shaders::VERTEX_140,
 				fragment_shader: shaders::COLOR_SHADOW_F_140,
 				outputs_srgb: false,
-				..Default::default()
 			},
-		)
-		.unwrap();
+		)?;
 
 		let colored_program = shader_from_source(
 			&display,
@@ -319,10 +332,8 @@ impl Window {
 				vertex_shader: shaders::VERTEX_140,
 				fragment_shader: shaders::COLOR_F_140,
 				outputs_srgb: false,
-				..Default::default()
 			},
-		)
-		.unwrap();
+		)?;
 
 		let resulting_window = Rc::new(Window {
 			data: RefCell::new(WindowData {
@@ -334,6 +345,8 @@ impl Window {
 				unprocessed_move_event: None,
 				last_event_invalidated: true,
 				new_title: None,
+				title: "Loading".into(),
+				is_wayland,
 				cursor_pos: Default::default(),
 				modifiers: ModifiersState::empty(),
 				render_validity: RenderValidity { validity: Rc::new(Cell::new(false)) },
@@ -361,8 +374,7 @@ impl Window {
 	fn build_winit_window(
 		attributes: WindowAttributes,
 		event_loop: &ActiveEventLoop,
-	) -> (winit::window::Window, Display<WindowSurface>) {
-		// let is_maximized = builder.m
+	) -> Result<(winit::window::Window, Display<WindowSurface>), Box<dyn std::error::Error>> {
 		// First we start by opening a new Window
 		let display_builder =
 			glutin_winit::DisplayBuilder::new().with_window_attributes(Some(attributes));
@@ -374,7 +386,9 @@ impl Window {
 		let (window, gl_config) = display_builder
 			.build(event_loop, config_template_builder, |mut configs| {
 				// Pick the first srgb capable config
-				let mut target = configs.next().unwrap();
+				// ponytail: the picker cannot return an error, so an empty config list panics here;
+				// glutin's EGL/GLX/WGL backends fail earlier with `NotFound` instead of yielding none.
+				let mut target = configs.next().expect("glutin returned no OpenGL configs");
 				for cfg in configs {
 					if target.srgb_capable() {
 						break;
@@ -383,10 +397,15 @@ impl Window {
 				}
 				target
 			})
-			.unwrap();
-		let window = window.unwrap();
+			.map_err(|e| {
+				format!("Failed to find a suitable OpenGL config (OpenGL 3.3 is required): {e}")
+			})?;
+		let window = window.ok_or("Failed to create the window")?;
 
-		let raw_window_handle = window.window_handle().unwrap().as_raw();
+		let raw_window_handle = window
+			.window_handle()
+			.map_err(|e| format!("Failed to get the native window handle: {e}"))?
+			.as_raw();
 
 		// Now we get the window size to use as the initial size of the Surface
 		let (width, height): (u32, u32) = window.inner_size().into();
@@ -395,27 +414,28 @@ impl Window {
 				.with_srgb(Some(true))
 				.build(
 					raw_window_handle,
-					NonZeroU32::new(width).unwrap(),
-					NonZeroU32::new(height).unwrap(),
+					NonZeroU32::new(width.max(1)).unwrap(),
+					NonZeroU32::new(height.max(1)).unwrap(),
 				);
 
 		// Finally we can create a Surface, use it to make a PossiblyCurrentContext and create the glium Display
-		let surface =
-			unsafe { gl_config.display().create_window_surface(&gl_config, &attrs).unwrap() };
+		let surface = unsafe { gl_config.display().create_window_surface(&gl_config, &attrs) }
+			.map_err(|e| format!("Failed to create the OpenGL window surface: {e}"))?;
 
 		let context_attributes = glutin::context::ContextAttributesBuilder::new()
 			.with_profile(GlProfile::Core) // requires OpenGL 3.3
 			.with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
 			.with_release_behavior(glutin::context::ReleaseBehavior::None)
 			.build(Some(raw_window_handle));
-		let current_context = unsafe {
-			gl_config
-				.display()
-				.create_context(&gl_config, &context_attributes)
-				.expect("failed to create context")
-		}
-		.make_current(&surface)
-		.unwrap();
+		let current_context =
+			unsafe { gl_config.display().create_context(&gl_config, &context_attributes) }
+				.map_err(|e| {
+					format!(
+						"Failed to create an OpenGL 3.3 core context (OpenGL 3.3 is required): {e}"
+					)
+				})?
+				.make_current(&surface)
+				.map_err(|e| format!("Failed to make the OpenGL context current: {e}"))?;
 
 		// Set up vsync
 		let swap_interval = glutin::surface::SwapInterval::Wait(NonZeroU32::new(1).unwrap());
@@ -423,9 +443,10 @@ impl Window {
 			error!("Failed to set vsync, error returned by set_swap_interval: {}", error);
 		}
 
-		let display = Display::from_context_surface(current_context, surface).unwrap();
+		let display = Display::from_context_surface(current_context, surface)
+			.map_err(|e| format!("Failed to initialize the OpenGL display: {e}"))?;
 
-		(window, display)
+		Ok((window, display))
 	}
 
 	pub fn add_global_event_handler<F: FnMut(&Window, &WindowEvent) + 'static>(&self, fun: F) {
@@ -451,15 +472,14 @@ impl Window {
 		root_widget.before_draw(self)
 	}
 
-	pub fn process_event<UserEvent>(
-		&self,
-		native_event: WindowEvent,
-		// allowing event_loop to be unused because it's only used on some platforms
-		#[allow(unused_variables)] event_loop: &ActiveEventLoop,
-	) {
+	pub fn process_event<UserEvent>(&self, native_event: WindowEvent) {
 		use winit::event::MouseScrollDelta;
 
 		let event;
+		// Enable with RUST_LOG=gelatin=trace to see exactly what the OS delivers,
+		// which is the only reliable way to tell a missing binding from a mouse
+		// driver that swallows the button.
+		log::trace!("Window event: {native_event:?}");
 		{
 			let mut event_handlers = Vec::new();
 			std::mem::swap(&mut event_handlers, &mut self.data.borrow_mut().global_event_handlers);
@@ -477,11 +497,15 @@ impl Window {
 						return;
 					}
 
-					#[cfg(wayland_platform)]
-					if event_loop.is_wayland() {
+					if borrowed.is_wayland {
 						// We need to set the framebuffer size explicitly on Wayland (god knows why)
 						borrowed.display.resize((size.width, size.height));
 					}
+					borrowed.window.request_redraw();
+				}
+				WindowEvent::ScaleFactorChanged { .. } => {
+					event = None;
+					borrowed.render_validity.invalidate();
 					borrowed.window.request_redraw();
 				}
 				WindowEvent::CloseRequested => {
@@ -593,6 +617,10 @@ impl Window {
 		// the program sometimes crashes on wayland if this is
 		// done in the `MainEventsCleared` event.
 		let mut borrowed = self.data.borrow_mut();
+		if borrowed.title == title {
+			return;
+		}
+		borrowed.title.clone_from(&title);
 		borrowed.new_title = Some(title);
 		borrowed.render_validity.invalidate();
 	}
@@ -613,10 +641,31 @@ impl Window {
 		self.data.borrow_mut().window.request_redraw();
 	}
 
+	/// Start a native window drag.
+	///
+	/// Applications can use this from a pointer handler for a custom top drag
+	/// strip. The operating system decides whether the current pointer event
+	/// can start a drag.
+	pub fn drag_window(&self) -> Result<(), winit::error::ExternalError> {
+		self.data.borrow().window.drag_window()
+	}
+
+	pub fn set_visible(&self, visible: bool) {
+		self.data.borrow().window.set_visible(visible);
+	}
+
+	pub fn focus_window(&self) {
+		self.data.borrow().window.focus_window();
+	}
+
+	pub fn theme(&self) -> Option<winit::window::Theme> {
+		self.data.borrow().window.theme()
+	}
+
 	pub fn main_events_cleared(&self) {
-		// this way self.data is not borrowed while `before_draw` is running.
 		let root_widget = self.data.borrow().root_widget.clone();
-		if let Some(event) = self.data.borrow_mut().unprocessed_move_event.take() {
+		let event = self.data.borrow_mut().unprocessed_move_event.take();
+		if let Some(event) = event {
 			root_widget.handle_event(&event);
 		}
 	}
@@ -679,23 +728,34 @@ impl Window {
 			projection_transform: &projection_transform,
 		};
 
-		// Clearing the framebuffer with fully black
-		// then drawing a full-screen quad to emulate colored clearing.
-		// This is a workaround for https://github.com/glium/glium/issues/1842
-		target.clear_color(0.0, 0.0, 0.0, 1.0);
-		draw_context.clear_color(&mut target, borrowed.bg_color, None);
+		// Drawing a full-screen quad to emulate colored clearing instead of
+		// `Surface::clear_color`. This is a workaround for
+		// https://github.com/glium/glium/issues/1842. The window is always opaque, so the
+		// quad overwrites every pixel and a preceding clear would be redundant.
+		let [r, g, b, _] = borrowed.bg_color;
+		draw_context.clear_color(&mut target, [r, g, b, 1.0], None);
 
 		// Using the cloned root instead of self.root_widget doesn't make much difference
 		// because self is being borrowed by through the draw_context anyways but it's fine.
-		let next_update = borrowed.root_widget.draw(&mut target, &draw_context).unwrap();
+		let next_update = match borrowed.root_widget.draw(&mut target, &draw_context) {
+			Ok(next_update) => next_update,
+			Err(e) => {
+				error!("Failed to draw the widgets: {e}");
+				NextUpdate::Latest
+			}
+		};
 
 		// After all widgets are drawn, let's set the alpha values of all the pixels to 1.
 		// This is required on Wayland because the Wayland compositor very kindly takes
 		// the alpha values into account and blends the framebuffer set by applications
-		// with the rest of the desktop.
-		self.set_alpha_to_1(&mut target, &draw_context);
+		// with the rest of the desktop. Other platforms ignore the framebuffer alpha.
+		if borrowed.is_wayland {
+			self.set_alpha_to_1(&mut target, &draw_context);
+		}
 
-		target.finish().unwrap();
+		if let Err(e) = target.finish() {
+			error!("Failed to swap the buffers: {e}");
+		}
 		borrowed.render_validity.make_valid();
 		next_update
 	}
@@ -720,10 +780,6 @@ impl Window {
 		borrowed.window.set_fullscreen(monitor);
 	}
 
-	pub fn set_maximized(&self, maximized: bool) {
-		self.data.borrow_mut().window.set_maximized(maximized);
-	}
-
 	/// Sets the alpha values by drawing a quad covering the entire framebuffer
 	/// with a blending mode set to max and a shader that draws (0,0,0,1) values
 	fn set_alpha_to_1(&self, target: &mut Frame, context: &DrawContext) {
@@ -741,14 +797,14 @@ impl Window {
 			matrix: Into::<[[f32; 4]; 4]>::into(transform),
 			color: [0.0f32, 0.0, 0.0, 1.0],
 		};
-		target
-			.draw(
-				context.unit_quad_vertices,
-				context.unit_quad_indices,
-				context.colored_program,
-				&uniforms,
-				&image_draw_params,
-			)
-			.unwrap();
+		if let Err(e) = target.draw(
+			context.unit_quad_vertices,
+			context.unit_quad_indices,
+			context.colored_program,
+			&uniforms,
+			&image_draw_params,
+		) {
+			error!("Failed to set the framebuffer alpha: {e}");
+		}
 	}
 }

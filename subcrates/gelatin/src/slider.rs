@@ -1,13 +1,17 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{
+	cell::RefCell,
+	rc::Rc,
+	time::{Duration, Instant},
+};
 
 use cgmath::{Matrix4, Vector3};
-use glium::{uniform, Frame, Surface};
+use glium::{Frame, Surface, uniform};
 use winit::event::{ElementState, MouseButton};
 
+use crate::NextUpdate;
 use crate::add_common_widget_functions;
 use crate::misc::{Alignment, Length, LogicalRect, LogicalVector, WidgetPlacement};
 use crate::window::RenderValidity;
-use crate::NextUpdate;
 use crate::{DrawContext, Event, EventKind, Widget, WidgetData, WidgetError};
 
 struct SliderData {
@@ -20,6 +24,9 @@ struct SliderData {
 	click: bool,
 	hover: bool,
 	on_value_change: Option<Rc<dyn Fn()>>,
+	on_double_click: Option<Rc<dyn Fn()>>,
+	last_click: Option<Instant>,
+	scroll_accum: f32,
 	shadow_color: [f32; 3],
 
 	render_validity: RenderValidity,
@@ -53,6 +60,9 @@ impl Slider {
 				click: false,
 				hover: false,
 				on_value_change: None,
+				on_double_click: None,
+				last_click: None,
+				scroll_accum: 0.0,
 				shadow_color: [0.0, 0.0, 0.0],
 				render_validity: Default::default(),
 				//rendered_valid: false,
@@ -92,6 +102,9 @@ impl Slider {
 	pub fn set_on_value_change<T: Fn() + 'static>(&self, callback: T) {
 		let mut borrowed = self.data.borrow_mut();
 		borrowed.on_value_change = Some(Rc::new(callback));
+	}
+	pub fn set_on_double_click<T: Fn() + 'static>(&self, callback: T) {
+		self.data.borrow_mut().on_double_click = Some(Rc::new(callback));
 	}
 
 	pub fn set_shadow_color(&self, color: [f32; 3]) {
@@ -220,17 +233,76 @@ impl Widget for Slider {
 				callback();
 			}
 		};
+		// A reset (double click or middle click) must not also jump the value to the
+		// pointer, so the drag is cancelled and the press consumed.
+		let reset = || {
+			let callback = {
+				let mut borrowed = self.data.borrow_mut();
+				borrowed.click = false;
+				borrowed.last_click = None;
+				borrowed.on_double_click.clone()
+			};
+			if let Some(callback) = callback {
+				callback();
+			}
+		};
 		match event.kind {
 			EventKind::MouseMove => {
 				check_value_change();
 			}
+			EventKind::MouseScroll { delta } => {
+				let on_value_change = {
+					let mut borrowed = self.data.borrow_mut();
+					borrowed.hover = borrowed.drawn_bounds.contains(event.cursor_pos);
+					if borrowed.hover {
+						// Free-spinning wheels and trackpads emit many small deltas.
+						borrowed.scroll_accum += delta.vec.y + delta.vec.x;
+						let steps = borrowed.scroll_accum.trunc();
+						borrowed.scroll_accum -= steps;
+						let last = borrowed.steps.saturating_sub(1) as i64;
+						let value = (borrowed.value as i64 + steps as i64).clamp(0, last) as u32;
+						if value != borrowed.value {
+							borrowed.value = value;
+							borrowed.render_validity.invalidate();
+							borrowed.on_value_change.clone()
+						} else {
+							None
+						}
+					} else {
+						None
+					}
+				};
+				if let Some(callback) = on_value_change {
+					callback();
+				}
+			}
+			EventKind::MouseButton {
+				state: ElementState::Pressed,
+				button: MouseButton::Middle,
+				..
+			} => {
+				if self.data.borrow().hover {
+					reset();
+				}
+			}
 			EventKind::MouseButton { state, button: MouseButton::Left, .. } => match state {
 				ElementState::Pressed => {
-					{
+					let is_double_click = {
 						let mut borrowed = self.data.borrow_mut();
 						borrowed.click = borrowed.hover;
+						let now = Instant::now();
+						let is_double_click = borrowed.click
+							&& borrowed.last_click.is_some_and(|last| {
+								now.duration_since(last) < Duration::from_millis(250)
+							});
+						borrowed.last_click = borrowed.click.then_some(now);
+						is_double_click
+					};
+					if is_double_click {
+						reset();
+					} else {
+						check_value_change();
 					}
-					check_value_change();
 				}
 				ElementState::Released => {
 					let mut borrowed = self.data.borrow_mut();

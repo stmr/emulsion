@@ -2,14 +2,14 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use cgmath::{Matrix4, Vector3};
-use glium::{uniform, Frame, Surface};
+use glium::{Frame, Surface, uniform};
 use winit::event::{ElementState, MouseButton};
 
+use crate::NextUpdate;
 use crate::add_common_widget_functions;
 use crate::misc::{Alignment, Length, LogicalRect, LogicalVector, WidgetPlacement};
 use crate::picture::Picture;
 use crate::window::RenderValidity;
-use crate::NextUpdate;
 use crate::{DrawContext, Event, EventKind, Widget, WidgetData, WidgetError};
 
 struct ButtonData {
@@ -121,14 +121,13 @@ impl Widget for Button {
 				let sampler = texture
 					.sampled()
 					.wrap_function(glium::uniforms::SamplerWrapFunction::Clamp)
-					.minify_filter(glium::uniforms::MinifySamplerFilter::Linear)
+					.minify_filter(glium::uniforms::MinifySamplerFilter::LinearMipmapLinear)
 					.magnify_filter(glium::uniforms::MagnifySamplerFilter::Linear);
 				let uniforms = uniform! {
 					matrix: Into::<[[f32; 4]; 4]>::into(transform),
 					tex: sampler,
 					bg_color: borrowed.bg_color,
 					texture_size: texture_size,
-					//brighten: if self.hover { 0.15f32 } else { 0.0f32 },
 					brighten: 0.0f32,
 					shadow_color: Into::<[f32; 3]>::into(Vector3::<f32>::new(0.0, 0.0, 0.0)),
 					shadow_offset: if borrowed.click {
@@ -150,7 +149,6 @@ impl Widget for Button {
 					matrix: Into::<[[f32; 4]; 4]>::into(transform),
 					bg_color: borrowed.bg_color,
 					size: texture_size,
-					//brighten: if self.hover { 0.15f32 } else { 0.0f32 },
 					brighten: 0.0f32,
 					shadow_color: Into::<[f32; 3]>::into(Vector3::<f32>::new(0.0, 0.0, 0.0)),
 					shadow_offset: if borrowed.click {

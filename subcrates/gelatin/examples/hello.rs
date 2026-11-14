@@ -4,7 +4,6 @@ use gelatin::{
 };
 
 use std::cell::Cell;
-use std::f32;
 use std::rc::Rc;
 
 struct MyApplicationHandler;
@@ -77,9 +76,9 @@ impl gelatin::application::ApplicationHandler for MyApplicationHandler {
 
 	fn handle_window_event(
 		&mut self,
-		event_loop: &gelatin::event_loop::ActiveEventLoop,
-		window_id: winit::window::WindowId,
-		event: &winit::event::WindowEvent,
+		_event_loop: &gelatin::event_loop::ActiveEventLoop,
+		_window_id: winit::window::WindowId,
+		_event: &winit::event::WindowEvent,
 	) -> gelatin::NextUpdate {
 		gelatin::NextUpdate::Latest
 	}
