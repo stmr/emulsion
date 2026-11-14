@@ -1,21 +1,24 @@
 [package]
 name = "emulsion"
-version = "12.3.0"
+version = "13.0.0"
 description = "A fast and minimalistic image viewer"
-repository = "https://github.com/ArturKovacs/emulsion"
-authors = ["Artur Barnabas <kovacs.artur.barnabas@gmail.com>"]
+repository = "https://github.com/stmr/emulsion"
+authors = ["Artur Barnabas <kovacs.artur.barnabas@gmail.com>", "The Emulsion Contributors"]
 license = "MIT"
 readme = "README.md"
-edition = "2018"
+edition = "2024"
 build = "build.rs"
 
 [package.metadata.bundle]
 name = "Emulsion"
-identifier = "io.github.arturkovacs.emulsion"
-icon = ["resource_dev/emulsion.png"]
+identifier = "io.github.stmr.emulsion"
+icon = ["resource_dev/emulsion.icns"]
 resources = ["LICENSE.txt"]
+category = "public.app-category.photography"
 short_description = "A lightweight and minimalistic image viewer"
-copyright = "Copyright (c) 2020 The Emulsion Contributors"
+copyright = "Copyright (c) 2020-2026 The Emulsion Contributors"
+osx_minimum_system_version = "11.0"
+osx_info_plist_exts = ["distribution/macos/info.plist.fragment"]
 linux_exec_args = "%f"
 linux_mime_types = [
     "image/jpeg",
@@ -63,26 +66,39 @@ benchmark = ["gelatin/benchmark"]
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1.11"
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = { version = "0.21", default-features = false }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSAlert", "NSApplication", "NSButton", "NSColorSpace", "NSControl", "NSOpenPanel", "NSPanel", "NSResponder", "NSSavePanel", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSURL"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFDictionary", "CFNumber", "CFString", "CFURL"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGBitmapContext", "CGColorSpace", "CGContext", "CGGeometry", "CGImage"] }
+objc2-image-io = { version = "0.3", default-features = false, features = ["std", "CGImageProperties", "CGImageSource", "objc2-core-graphics"] }
+raw-window-handle = "0.6.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_SystemInformation", "Win32_UI_WindowsAndMessaging"] }
 
 [dependencies]
 gelatin = { path = "./subcrates/gelatin", version = "0.14" }
-ureq = { version = "2.0.2", features = ["json"], optional = true }
-lazy_static = "1.4.0"
+ureq = { version = "3.1", features = ["json"], optional = true }
 directories-next = "2.0.0"
-open = "5"
-sys-info = "0.9.0"
-backtrace = "0.3.56"
-serde = { version = "1.0.123", features = ["derive"] }
-toml = "0.8.12"
-rand = "0.8.3"
+open = "5.4"
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.1"
+rand = "0.10"
 lexical-sort = "0.3.1"
-trash = "4.1"
-clap = { version = "4.0.15" }
-kamadak-exif = "0.5.3"
-arboard = { version = "3.3", features = ["wayland-data-control"] }
-resvg = "0.41"
-usvg = "0.41"
-tiny-skia = "0.11.4"
+trash = "5.2"
+clap = { version = "4.6" }
+kamadak-exif = "0.6"
+arboard = { version = "3.6", features = ["wayland-data-control"] }
+resvg = "0.50"
+usvg = "0.50"
+tiny-skia = "0.12"
+moxcms = "0.8"
 log = "0.4"
 env_logger = "0.11"
-thiserror = "1.0.59"
+thiserror = "2.0"
