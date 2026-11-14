@@ -2,13 +2,13 @@ use std::{
 	cell::{Ref, RefCell},
 	path::PathBuf,
 	rc::{Rc, Weak},
-	sync::{Arc, Mutex},
+	sync::{Arc, Mutex, mpsc},
 	time::{Duration, Instant},
 };
 
 use gelatin::{
 	cgmath::{Matrix4, Vector2, Vector3},
-	glium::{uniform, uniforms::MagnifySamplerFilter, Frame, Program, Surface},
+	glium::{Frame, Program, Surface, uniform, uniforms::MagnifySamplerFilter},
 	shaders::ShaderDescriptor,
 	winit::{
 		event::{ElementState, MouseButton},
@@ -17,29 +17,94 @@ use gelatin::{
 };
 
 use gelatin::{
+	Display, DrawContext, Event, EventKind, NextUpdate, Widget, WidgetData, WidgetError,
 	add_common_widget_functions,
 	application::request_exit,
 	misc::{Alignment, Length, LogicalRect, LogicalVector, WidgetPlacement},
 	window::{RenderValidity, Window},
 	winit::keyboard::ModifiersState,
-	Display, DrawContext, Event, EventKind, NextUpdate, Widget, WidgetData, WidgetError,
 };
 
 use crate::{
 	clipboard_handler::ClipboardHandler,
-	configuration::{Antialias, Cache, Configuration},
-	image_cache::{image_loader::Orientation, AnimationFrameTexture},
+	configuration::{
+		Antialias, Cache, Configuration, DEFAULT_GAMMA, clamp_gamma, gamma_from_slider_position,
+	},
+	image_cache::{
+		AnimationFrameTexture,
+		image_loader::{Orientation, svg_render_size},
+	},
 	input_handling::*,
 	playback_manager::*,
 	shaders,
-	utils::virtual_keycode_to_string,
+	utils::{physical_key_to_string, virtual_keycode_to_string},
 };
 
-use super::{bottom_bar::BottomBar, copy_notification::CopyNotifications, help_screen::HelpScreen};
+use super::{
+	bottom_bar::{BOTTOM_BAR_HEIGHT, BottomBar},
+	copy_notification::CopyNotifications,
+	help_screen::HelpScreen,
+	thumbnail_stripe::{StripeMode, ThumbnailStripe},
+};
 
 const MIN_ZOOM_FACTOR: f32 = 0.0001;
 const MAX_ZOOM_FACTOR: f32 = 10000.0;
 const AA_TEXEL_SIZE_THRESHOLD: f32 = 4f32;
+const MACOS_DRAG_STRIP_HEIGHT: f32 = 28.0;
+
+/// An instant far enough in the past that no click is "recent" relative to it.
+fn long_ago() -> Instant {
+	let now = Instant::now();
+	now.checked_sub(Duration::from_secs(10)).unwrap_or(now)
+}
+
+/// Continuous mip level for an image drawn with `texel_size` physical pixels per texel: 0 while
+/// magnified or 1:1, then one level per halving. It is fed to `textureLod` with trilinear
+/// filtering, so levels blend smoothly instead of popping.
+fn lod_for_texel_size(texel_size: f32) -> f32 {
+	if texel_size > 0.0 { (-texel_size.log2()).max(0.0) } else { 0.0 }
+}
+
+/// An SVG texture is magnified up to this many physical pixels per texel before it is rendered
+/// again.
+const SVG_SHARPEN_TEXEL_SIZE: f32 = 1.5;
+/// How long the zoom has to rest before a sharper render of an SVG is asked for.
+const SVG_SETTLE: Duration = Duration::from_millis(150);
+
+/// The box (physical pixels) to render an SVG again to when its `texture` (width, height) is
+/// shown with `texel_size` physical pixels per texel and is blurry that way. `None` when it
+/// is sharp enough, or when the size caps leave no notably bigger render to get.
+fn sharper_svg_size(texture: (u32, u32), texel_size: f32) -> Option<(u32, u32)> {
+	if texel_size <= SVG_SHARPEN_TEXEL_SIZE {
+		return None;
+	}
+	let (width, height) = (texture.0 as f32, texture.1 as f32);
+	let fit = ((width * texel_size).ceil() as u32, (height * texel_size).ceil() as u32);
+	let (target_width, target_height) = svg_render_size(width, height, fit);
+	(target_width.max(target_height) as f32 > width.max(height) * 1.05).then_some(fit)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_side_button_direction(button: MouseButton) -> Option<i32> {
+	match button {
+		MouseButton::Back | MouseButton::Other(3) => Some(-1),
+		MouseButton::Forward | MouseButton::Other(4) => Some(1),
+		_ => None,
+	}
+}
+/// Horizontal scroll needed for one image step. Swipes and free-spinning thumb wheels emit
+/// many small deltas, so they are accumulated instead of navigating per event.
+const SWIPE_STEP: f32 = 2.0;
+
+/// Consumes one step worth of horizontal scroll, returning -1 (previous) or 1 (next).
+fn take_swipe_step(accumulated: &mut f32) -> Option<i32> {
+	if accumulated.abs() < SWIPE_STEP {
+		return None;
+	}
+	let direction = if *accumulated > 0.0 { -1 } else { 1 };
+	*accumulated = 0.0;
+	Some(direction)
+}
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ScalingMode {
@@ -133,9 +198,12 @@ struct PictureWidgetData {
 	// It's an option to allow manual destruction.
 	clipboard_handler: Option<ClipboardHandler>,
 	clipboard_request_was_pending: bool,
-
+	/// Outcome of the trash operation running on a worker thread, if one is in flight.
+	pending_delete: Option<mpsc::Receiver<bool>>,
 	program: Program,
 	bright_shade: f32,
+	gamma: f32,
+	gamma_feedback_until: Option<Instant>,
 	/// Size of an image texel in physical display pixels
 	img_texel_size: f32,
 	scaling: ScalingMode,
@@ -151,6 +219,8 @@ struct PictureWidgetData {
 	ver_pan_vel: f32,
 	/// The velocity of zooming
 	zoom_vel: f32,
+	/// Horizontal scroll collected since the last image step.
+	hor_scroll_accum: f32,
 
 	last_click_time: Instant,
 	last_mouse_pos: LogicalVector,
@@ -161,11 +231,24 @@ struct PictureWidgetData {
 
 	first_draw: bool,
 	last_cam_move_time: Instant,
+	#[cfg(feature = "benchmark")]
+	benchmark_load_started: Option<Instant>,
 	next_update: NextUpdate,
 	bottom_bar: Rc<BottomBar>,
+	thumbnails: Option<Rc<ThumbnailStripe>>,
+	thumbnail_mode: StripeMode,
 	left_to_pan_hint: Rc<HelpScreen>,
 	copy_notifications: CopyNotifications,
 	window: Weak<Window>,
+	/// Last title handed to the window, so an identical one is not set (and redrawn) again.
+	last_title: String,
+	/// Last visibility pushed to the thumbnail strip.
+	stripe_visible: Option<bool>,
+	/// Zoom (`img_texel_size`) the last time it was looked at, and since when it has been that.
+	svg_zoom: (f32, Instant),
+	/// The SVG texture a sharper render was asked for, and its file. Cleared when the texture
+	/// changes.
+	svg_rerender: Option<(AnimationFrameTexture, PathBuf)>,
 }
 impl WidgetData for PictureWidgetData {
 	fn placement(&mut self) -> &mut WidgetPlacement {
@@ -181,6 +264,9 @@ impl WidgetData for PictureWidgetData {
 impl PictureWidgetData {
 	fn fit_image_to_panel(&mut self, dpi_scale: f32, stretch: bool) {
 		let size = self.drawn_bounds.size.vec;
+		if size.x <= 0.0 || size.y <= 0.0 {
+			return;
+		}
 		if let Some(texture) = self.get_texture() {
 			let panel_aspect = size.x / size.y;
 			let (img_phys_w, img_pyhs_h) = {
@@ -200,7 +286,9 @@ impl PictureWidgetData {
 			let fits_in_widget =
 				widget_phys_size.x >= img_phys_w && widget_phys_size.y >= img_pyhs_h;
 			self.img_pos = LogicalVector::new(size.x * 0.5, size.y * 0.5);
-			if fits_in_widget && !stretch {
+			// An SVG is scaled to the panel like a stretched picture: it has no size of its own
+			// to keep, and a bigger panel gets a sharper render of it (`update_svg_resolution`).
+			if fits_in_widget && !stretch && !texture.svg {
 				self.img_texel_size = 1.0;
 			} else {
 				self.img_texel_size = img_texel_size * dpi_scale;
@@ -214,6 +302,10 @@ impl PictureWidgetData {
 	}
 
 	fn zoom_image(&mut self, anchor: LogicalVector, mut delta: f32) {
+		if self.img_texel_size <= 0.0 {
+			// Nothing has been fitted yet, so there is no scale to zoom from.
+			return;
+		}
 		delta = if delta > 0.0 { delta + 1.0 } else { 1.0 / (delta.abs() + 1.0) };
 		let mut image_texel_size = (self.img_texel_size * delta).max(0.0);
 		if (image_texel_size - 1.0).abs() < 0.01 {
@@ -226,6 +318,65 @@ impl PictureWidgetData {
 		self.scaling = ScalingMode::Fixed;
 		self.update_scaling_buttons();
 		self.render_validity.invalidate();
+	}
+
+	/// Keeps SVGs sharp. Tells the cache what area SVGs are fitted to when they are loaded,
+	/// and, once a zoom has settled, asks for a sharper render of the shown SVG if it is
+	/// magnified (`sharper_svg_size`). The old render stays on screen until the new one is
+	/// ready. Returns when this has to run again, if it is waiting for the zoom to settle or
+	/// for the loader.
+	fn update_svg_resolution(&mut self, dpi_scale: f32, now: Instant) -> Option<Instant> {
+		let view = self.drawn_bounds.size.vec * dpi_scale;
+		if view.x >= 1.0 && view.y >= 1.0 {
+			self.playback_manager.set_svg_view(view.x.round() as u32, view.y.round() as u32);
+		}
+		if (self.img_texel_size - self.svg_zoom.0).abs() > f32::EPSILON {
+			self.svg_zoom = (self.img_texel_size, now);
+		}
+		let texture = self.get_texture().filter(|texture| texture.svg)?;
+		// A render that was asked for and failed isn't asked for again.
+		if let Some((asked, _)) = &self.svg_rerender
+			&& Rc::ptr_eq(&asked.tex_grid, &texture.tex_grid)
+		{
+			return None;
+		}
+		let fit = sharper_svg_size((texture.w, texture.h), self.img_texel_size)?;
+		let settled = self.svg_zoom.1 + SVG_SETTLE;
+		if now < settled {
+			return Some(settled);
+		}
+		let LoadedImgPath::Loaded(path) = self.playback_manager.shown_file_path().clone() else {
+			return None;
+		};
+		if self.playback_manager.rerender_svg(fit) {
+			self.svg_rerender = Some((texture, path));
+			None
+		} else {
+			Some(now + SVG_SETTLE)
+		}
+	}
+
+	/// The texture changed. If it is the sharper render of the SVG asked for, the zoom is
+	/// scaled with the texture so that the picture keeps its size.
+	fn adopt_rerendered_svg(
+		&mut self,
+		prev: Option<&AnimationFrameTexture>,
+		new: Option<&AnimationFrameTexture>,
+	) {
+		let Some((asked, path)) = self.svg_rerender.take() else {
+			return;
+		};
+		let (Some(prev), Some(new)) = (prev, new) else {
+			return;
+		};
+		let same_file = matches!(
+			self.playback_manager.shown_file_path(),
+			LoadedImgPath::Loaded(shown) if *shown == path
+		);
+		if same_file && new.svg && Rc::ptr_eq(&asked.tex_grid, &prev.tex_grid) {
+			self.img_texel_size *= prev.w as f32 / new.w as f32;
+			self.update_scaling_buttons();
+		}
 	}
 
 	fn update_image_transform(&mut self, dpi_scale: f32) {
@@ -245,7 +396,7 @@ impl PictureWidgetData {
 		self.prev_draw_size = self.drawn_bounds.size;
 	}
 
-	fn apply_camera_movement(&mut self, dpi_scale: f32) {
+	fn apply_camera_movement(&mut self) {
 		fn animate_value(v: &mut f32, dir: f32, dt: f32, next_update: &mut NextUpdate) {
 			#[allow(clippy::float_cmp)]
 			if v.signum() != dir {
@@ -293,7 +444,8 @@ impl PictureWidgetData {
 			self.zoom_image(anchor, self.zoom_vel * dt_sec);
 		}
 		if self.hor_pan_input.moving() || self.ver_pan_input.moving() {
-			let panning_speed = 400.0 * dpi_scale;
+			// `img_pos` is in logical pixels so the speed must not depend on the DPI scale.
+			let panning_speed = 400.0;
 			let pos_delta = Vector2::new(self.hor_pan_vel, self.ver_pan_vel) * dt_sec;
 			self.scaling = ScalingMode::Fixed;
 			self.update_scaling_buttons();
@@ -311,7 +463,7 @@ impl PictureWidgetData {
 	}
 
 	fn set_window_title_filename(
-		&self,
+		&mut self,
 		window: &Window,
 		playback_state: PlaybackState,
 		file_path: &LoadedImgPath,
@@ -333,8 +485,30 @@ impl PictureWidgetData {
 			}
 			LoadedImgPath::Loaded(path) => title_config.format_file_path(path),
 		};
-		let title = format!("{}{}{}", name, playback, title_config.format_program_name());
-		window.set_title(title);
+		let now = Instant::now();
+		let gamma_feedback = match self.gamma_feedback_until {
+			Some(until) if now < until => true,
+			Some(_) => {
+				self.gamma_feedback_until = None;
+				false
+			}
+			None => false,
+		};
+		let title = if gamma_feedback {
+			format!(
+				"{}{} : Gamma {:.2}{}",
+				name,
+				playback,
+				self.gamma,
+				title_config.format_program_name()
+			)
+		} else {
+			format!("{}{}{}", name, playback, title_config.format_program_name())
+		};
+		if title != self.last_title {
+			self.last_title.clone_from(&title);
+			window.set_title(title);
+		}
 	}
 
 	fn get_texture(&self) -> Option<AnimationFrameTexture> {
@@ -403,9 +577,115 @@ impl PictureWidgetData {
 			}
 		}
 	}
+	fn pointer_over_bottom_bar(&self, point: LogicalVector) -> bool {
+		let bottom = self.drawn_bounds.pos.vec.y + self.drawn_bounds.size.vec.y;
+		self.bottom_bar.is_bar_visible() && point.vec.y >= bottom - BOTTOM_BAR_HEIGHT
+	}
+
+	fn pointer_over_thumbnails(&self, point: LogicalVector) -> bool {
+		self.thumbnails.as_ref().is_some_and(|stripe| stripe.contains_point(point))
+	}
+
+	fn pointer_over_overlay(&self, point: LogicalVector) -> bool {
+		self.pointer_over_bottom_bar(point) || self.pointer_over_thumbnails(point)
+	}
+
+	fn set_gamma(&mut self, gamma: f32, show_feedback: bool) {
+		self.gamma = clamp_gamma(gamma);
+		self.bottom_bar.set_gamma_slider_value(self.gamma);
+		if show_feedback {
+			self.gamma_feedback_until = Some(Instant::now() + Duration::from_secs(1));
+		}
+		self.render_validity.invalidate();
+	}
+
+	fn reset_gamma_for_navigation(&mut self) {
+		let reset = self
+			.configuration
+			.borrow()
+			.image
+			.as_ref()
+			.and_then(|section| section.reset_gamma_on_navigation)
+			.unwrap_or(false);
+		if reset {
+			let gamma = self
+				.configuration
+				.borrow()
+				.image
+				.as_ref()
+				.and_then(|section| section.gamma)
+				.unwrap_or(DEFAULT_GAMMA);
+			self.set_gamma(gamma, false);
+		}
+	}
+
+	fn adjust_gamma(&mut self, direction: i32) {
+		self.set_gamma(self.gamma + direction as f32 * 0.1, true);
+	}
+
+	fn reset_gamma(&mut self) {
+		self.set_gamma(DEFAULT_GAMMA, true);
+	}
 
 	fn update_scaling_buttons(&mut self) {
 		self.bottom_bar.update_scaling_buttons(self.scaling, self.img_texel_size);
+	}
+
+	/// Moves the shown file to the trash on a worker thread, `poll_pending_delete` finishes the job.
+	fn delete_shown_image(&mut self) {
+		if self.pending_delete.is_some() {
+			return;
+		}
+		let LoadedImgPath::Loaded(path) = self.playback_manager.shown_file_path().clone() else {
+			return;
+		};
+		let (sender, receiver) = mpsc::channel();
+		std::thread::spawn(move || {
+			let result = trash::delete(&path);
+			if let Err(error) = &result {
+				log::error!("Error while moving file '{path:?}' to trash: {error:?}");
+			}
+			// The receiver is only gone when the widget is, then nobody needs the result.
+			let _ = sender.send(result.is_ok());
+		});
+		self.pending_delete = Some(receiver);
+	}
+
+	/// Picks up the result of `delete_shown_image`: refreshes the folder (which advances to the
+	/// next image) on success and shows the failure notification otherwise.
+	fn poll_pending_delete(&mut self) {
+		let Some(receiver) = &self.pending_delete else {
+			return;
+		};
+		let succeeded = match receiver.try_recv() {
+			Ok(deleted) => deleted,
+			Err(mpsc::TryRecvError::Empty) => {
+				let next = Instant::now() + Duration::from_millis(50);
+				self.next_update = self.next_update.aggregate(NextUpdate::WaitUntil(next));
+				return;
+			}
+			Err(mpsc::TryRecvError::Disconnected) => {
+				log::error!("The trash thread stopped unexpectedly.");
+				false
+			}
+		};
+		self.pending_delete = None;
+		if succeeded {
+			self.playback_manager.update_directory();
+		} else {
+			self.copy_notifications.set_delete_failed();
+		}
+		self.render_validity.invalidate();
+	}
+
+	fn copy_shown_image(&mut self) {
+		if let LoadedImgPath::Loaded(path) = self.playback_manager.shown_file_path().clone()
+			&& let Some(clipboard_handler) = &mut self.clipboard_handler
+		{
+			clipboard_handler.request_copy(path);
+			self.copy_notifications.set_started();
+			self.clipboard_request_was_pending = true;
+		}
 	}
 }
 
@@ -422,25 +702,12 @@ impl PictureWidget {
 		configuration: Rc<RefCell<Configuration>>,
 		cache: Arc<Mutex<Cache>>,
 	) -> PictureWidget {
-		// let program = program!(display,
-		// 	140 => {
-		// 		vertex: shaders::VERTEX_140,
-		// 		fragment: shaders::FRAGMENT_140
-		// 	},
-		// 	110 => {
-		// 		vertex: shaders::VERTEX_110,
-		// 		fragment: shaders::FRAGMENT_110
-		// 	},
-		// )
-		// .unwrap();
-
 		let program = gelatin::shaders::shader_from_source(
 			display,
 			ShaderDescriptor {
 				vertex_shader: shaders::VERTEX_140,
 				fragment_shader: shaders::FRAGMENT_140,
 				outputs_srgb: false,
-				..Default::default()
 			},
 		)
 		.unwrap();
@@ -474,6 +741,14 @@ impl PictureWidget {
 			}
 		};
 
+		let gamma = configuration
+			.borrow()
+			.image
+			.as_ref()
+			.and_then(|section| section.gamma)
+			.map(clamp_gamma)
+			.unwrap_or(DEFAULT_GAMMA);
+
 		let mut data = PictureWidgetData {
 			placement: Default::default(),
 			drawn_bounds: Default::default(),
@@ -486,10 +761,13 @@ impl PictureWidget {
 			playback_manager: PlaybackManager::new(),
 			clipboard_handler: Some(ClipboardHandler::new()),
 			clipboard_request_was_pending: false,
+			pending_delete: None,
 			render_validity: Default::default(),
 
 			program,
 			bright_shade: 0.95,
+			gamma,
+			gamma_feedback_until: None,
 			img_texel_size: 0.0,
 			scaling,
 			img_pos: Default::default(),
@@ -500,35 +778,89 @@ impl PictureWidget {
 			hor_pan_vel: 0.0,
 			ver_pan_vel: 0.0,
 			zoom_vel: 0.0,
-			last_click_time: Instant::now() - Duration::from_secs(10),
+			hor_scroll_accum: 0.0,
+			last_click_time: long_ago(),
 			last_mouse_pos: Default::default(),
 			panning_2d: false,
 			panning_vert: false,
 			panning_hor: false,
 			hover_state: HoverState::None,
 			last_cam_move_time: Instant::now(),
+			#[cfg(feature = "benchmark")]
+			benchmark_load_started: None,
 			first_draw: true,
 			next_update: NextUpdate::Latest,
 			bottom_bar,
+			thumbnails: None,
+			thumbnail_mode: StripeMode::Off,
 			left_to_pan_hint,
 			copy_notifications,
 			window: Rc::downgrade(window),
+			last_title: String::new(),
+			stripe_visible: None,
+			svg_zoom: (0.0, Instant::now()),
+			svg_rerender: None,
 		};
+		data.bottom_bar.set_gamma_slider_value(data.gamma);
 		data.update_scaling_buttons();
 		PictureWidget { data: RefCell::new(data) }
 	}
-
 	add_common_widget_functions!(data);
+
+	/// Attaches the folder strip; the widget then keeps it fed with folder state and paths.
+	pub fn set_thumbnail_stripe(&self, stripe: Rc<ThumbnailStripe>, mode: StripeMode) {
+		let mut data = self.data.borrow_mut();
+		data.thumbnails = Some(stripe);
+		data.stripe_visible = None;
+		data.thumbnail_mode = mode;
+		data.render_validity.invalidate();
+	}
+
+	pub fn thumbnail_mode(&self) -> StripeMode {
+		self.data.borrow().thumbnail_mode
+	}
+
+	pub fn set_thumbnail_mode(&self, mode: StripeMode) {
+		let mut data = self.data.borrow_mut();
+		data.thumbnail_mode = mode;
+		let pinned = mode == StripeMode::Pinned;
+		if let Some(stripe) = data.thumbnails.clone() {
+			stripe.set_visible(pinned);
+			data.stripe_visible = Some(pinned);
+		}
+		data.render_validity.invalidate();
+	}
+
+	/// Cycles Off -> auto-hide -> pinned and remembers the choice.
+	pub fn cycle_thumbnail_mode(&self) {
+		let mode = self.thumbnail_mode().next();
+		log::debug!("Thumbnail strip mode: {mode:?}");
+		self.set_thumbnail_mode(mode);
+		let data = self.data.borrow();
+		data.cache.lock().unwrap().window.thumbnails = mode.as_str().to_owned();
+	}
 
 	pub fn set_bright_shade(&self, shade: f32) {
 		let mut borrowed = self.data.borrow_mut();
 		borrowed.bright_shade = shade;
 		borrowed.render_validity.invalidate();
 	}
-
 	pub fn set_img_size_to_orig(&self) {
 		let mut borrowed = self.data.borrow_mut();
 		borrowed.set_img_size_to_orig();
+	}
+
+	pub fn set_gamma(&self, gamma: f32) {
+		let mut borrowed = self.data.borrow_mut();
+		borrowed.set_gamma(gamma, true);
+	}
+
+	pub fn set_gamma_from_slider(&self, position: u32) {
+		let mut borrowed = self.data.borrow_mut();
+		borrowed.set_gamma(gamma_from_slider_position(position), true);
+	}
+	pub fn reset_gamma(&self) {
+		self.data.borrow_mut().reset_gamma();
 	}
 
 	pub fn set_img_size_to_fit(&self, stretch: bool) {
@@ -536,40 +868,113 @@ impl PictureWidget {
 		borrowed.set_img_size_to_fit(stretch);
 	}
 
+	#[cfg(feature = "benchmark")]
+	fn benchmark_load_started(data: &mut PictureWidgetData) {
+		data.benchmark_load_started = Some(Instant::now());
+	}
 	pub fn jump_to_index(&self, index: u32) {
 		let mut borrowed = self.data.borrow_mut();
+		borrowed.reset_gamma_for_navigation();
+		#[cfg(feature = "benchmark")]
+		Self::benchmark_load_started(&mut borrowed);
 		borrowed.playback_manager.request_load(LoadRequest::LoadAtIndex(index as usize));
 		borrowed.render_validity.invalidate();
 	}
 
 	pub fn jump_to_path<P: Into<PathBuf>>(&self, path: P) {
 		let mut borrowed = self.data.borrow_mut();
+		borrowed.reset_gamma_for_navigation();
+		#[cfg(feature = "benchmark")]
+		Self::benchmark_load_started(&mut borrowed);
 		borrowed.playback_manager.request_load(LoadRequest::FilePath(path.into()));
 		borrowed.render_validity.invalidate();
 	}
 
-	fn handle_key_input(&self, input_key: &str, modifiers: ModifiersState) {
-		let mut borrowed = self.data.borrow_mut();
-		macro_rules! triggered {
-			($action_name:ident) => {
-				action_triggered(&borrowed.configuration, $action_name, input_key, modifiers)
-			};
+	pub fn perform_action(&self, action_name: &str) {
+		if action_name == "toggle_thumbnails" {
+			self.cycle_thumbnail_mode();
+			return;
 		}
-		if triggered!(TOGGLE_FULLSCREEN_NAME) {
-			if let Some(window) = borrowed.window.upgrade() {
-				let fullscreen = !window.fullscreen();
-				window.set_fullscreen(fullscreen);
-				borrowed.bottom_bar.set_visible_if_should_show(!fullscreen);
-			}
-		}
-		if triggered!(ESCAPE_NAME) {
-			if let Some(window) = borrowed.window.upgrade() {
-				if window.fullscreen() {
-					window.set_fullscreen(false);
-					borrowed.bottom_bar.set_visible_if_should_show(true);
-				} else {
-					request_exit();
+		let mut data = self.data.borrow_mut();
+		match action_name {
+			"toggle_fullscreen" => {
+				if let Some(window) = data.window.upgrade() {
+					let fullscreen = !window.fullscreen();
+					window.set_fullscreen(fullscreen);
+					data.bottom_bar.set_fullscreen(fullscreen);
 				}
+			}
+			"img_prev" | "img_next" => {
+				data.reset_gamma_for_navigation();
+				#[cfg(feature = "benchmark")]
+				Self::benchmark_load_started(&mut data);
+				let request = if action_name == "img_prev" {
+					LoadRequest::LoadPrevious
+				} else {
+					LoadRequest::LoadNext
+				};
+				data.playback_manager.request_load(request);
+				data.render_validity.invalidate();
+			}
+			"gamma_decrease" => data.adjust_gamma(-1),
+			"gamma_increase" => data.adjust_gamma(1),
+			"gamma_reset" => data.reset_gamma(),
+			"img_fit" => data.set_img_size_to_fit(true),
+			"img_fit_best" => data.set_img_size_to_fit(false),
+			"img_orig" => data.set_img_size_to_orig(),
+			"toggle_antialias" => data.toggle_antialias(),
+			"automatic_antialias" => data.set_automatic_antialias(),
+			"play_anim" => match data.playback_manager.playback_state() {
+				PlaybackState::Forward => data.playback_manager.pause_playback(),
+				_ => data.playback_manager.start_playback_forward(),
+			},
+			"play_present" => {
+				match data.playback_manager.playback_state() {
+					PlaybackState::Present => data.playback_manager.pause_playback(),
+					_ => data.playback_manager.start_presentation(),
+				}
+				data.render_validity.invalidate();
+			}
+			"play_present_rnd" => {
+				match data.playback_manager.playback_state() {
+					PlaybackState::RandomPresent => data.playback_manager.pause_playback(),
+					_ => data.playback_manager.start_random_presentation(),
+				}
+				data.render_validity.invalidate();
+			}
+			"img_del" => data.delete_shown_image(),
+			"img_copy" => data.copy_shown_image(),
+			_ => log::warn!("Ignoring unknown application action '{action_name}'"),
+		}
+	}
+
+	/// Runs the actions and custom commands bound to the key. Returns whether any binding fired.
+	fn handle_key_input(&self, input_key: &str, modifiers: ModifiersState) -> bool {
+		let mut borrowed = self.data.borrow_mut();
+		let mut fired = false;
+		macro_rules! triggered {
+			($action_name:ident) => {{
+				let triggered =
+					action_triggered(&borrowed.configuration, $action_name, input_key, modifiers);
+				fired |= triggered;
+				triggered
+			}};
+		}
+		if triggered!(TOGGLE_FULLSCREEN_NAME)
+			&& let Some(window) = borrowed.window.upgrade()
+		{
+			let fullscreen = !window.fullscreen();
+			window.set_fullscreen(fullscreen);
+			borrowed.bottom_bar.set_fullscreen(fullscreen);
+		}
+		if triggered!(ESCAPE_NAME)
+			&& let Some(window) = borrowed.window.upgrade()
+		{
+			if window.fullscreen() {
+				window.set_fullscreen(false);
+				borrowed.bottom_bar.set_fullscreen(false);
+			} else {
+				request_exit();
 			}
 		}
 		if triggered!(PLAY_ANIM_NAME) {
@@ -579,12 +984,27 @@ impl PictureWidget {
 			}
 		}
 		if triggered!(IMG_PREV_NAME) {
+			borrowed.reset_gamma_for_navigation();
+			#[cfg(feature = "benchmark")]
+			Self::benchmark_load_started(&mut borrowed);
 			borrowed.playback_manager.request_load(LoadRequest::LoadPrevious);
 			borrowed.render_validity.invalidate();
 		}
 		if triggered!(IMG_NEXT_NAME) {
+			borrowed.reset_gamma_for_navigation();
+			#[cfg(feature = "benchmark")]
+			Self::benchmark_load_started(&mut borrowed);
 			borrowed.playback_manager.request_load(LoadRequest::LoadNext);
 			borrowed.render_validity.invalidate();
+		}
+		if triggered!(GAMMA_DECREASE_NAME) {
+			borrowed.adjust_gamma(-1);
+		}
+		if triggered!(GAMMA_INCREASE_NAME) {
+			borrowed.adjust_gamma(1);
+		}
+		if triggered!(GAMMA_RESET_NAME) {
+			borrowed.reset_gamma();
 		}
 		if triggered!(IMG_FIT_NAME) {
 			borrowed.set_img_size_to_fit(true);
@@ -616,37 +1036,16 @@ impl PictureWidget {
 			borrowed.render_validity.invalidate();
 		}
 		if triggered!(IMG_DEL_NAME) {
-			if let LoadedImgPath::Loaded(path) = borrowed.playback_manager.shown_file_path() {
-				if let Err(e) = trash::delete(path) {
-					eprintln!("Error while moving file '{:?}' to trash: {:?}", path, e);
-				}
-				if let Err(e) = borrowed.playback_manager.update_directory() {
-					eprintln!("Error while updating directory {:?}", e);
-				}
-				borrowed.render_validity.invalidate();
-			}
+			borrowed.delete_shown_image();
 		}
 		if triggered!(IMG_COPY_NAME) {
-			if let LoadedImgPath::Loaded(path) = borrowed.playback_manager.shown_file_path().clone()
-			{
-				let request_started;
-				if let Some(clipboard_handler) = &mut borrowed.clipboard_handler {
-					request_started = true;
-					clipboard_handler.request_copy(path);
-					borrowed.copy_notifications.set_started();
-				} else {
-					request_started = false;
-				}
-				if request_started {
-					borrowed.clipboard_request_was_pending = true;
-				}
-			}
+			borrowed.copy_shown_image();
 		}
 		if let LoadedImgPath::Loaded(img_path) = borrowed.playback_manager.shown_file_path() {
 			if let Some(folder_path) = img_path.parent() {
 				let img_and_folder = (img_path.to_str(), folder_path.to_str());
 				if let (Some(img_path), Some(folder_path)) = img_and_folder {
-					execute_triggered_commands(
+					fired |= execute_triggered_commands(
 						borrowed.configuration.clone(),
 						input_key,
 						modifiers,
@@ -660,6 +1059,12 @@ impl PictureWidget {
 				log::error!("Could not get parent folder for the image path {:?}", img_path);
 			}
 		}
+		let cycle_thumbnails = triggered!(TOGGLE_THUMBNAILS_NAME);
+		drop(borrowed);
+		if cycle_thumbnails {
+			self.cycle_thumbnail_mode();
+		}
+		fired
 	}
 }
 
@@ -678,30 +1083,79 @@ impl Widget for PictureWidget {
 			return data.next_update;
 		}
 		let now = Instant::now();
+		let svg_check_at =
+			data.update_svg_resolution(window.window_mut().scale_factor() as f32, now);
 		let prev_texture = data.playback_manager.image_texture();
 		data.next_update = data.playback_manager.update_image(window);
+		if let Some(check_at) = svg_check_at {
+			data.next_update = data.next_update.aggregate(NextUpdate::WaitUntil(check_at));
+		}
 		let new_texture = data.playback_manager.image_texture();
 		let curr_file_index = data.playback_manager.current_file_index();
 		let curr_dir_len = data.playback_manager.current_dir_len();
 		if let (Some(curr_file_index), Some(curr_dir_len)) = (curr_file_index, curr_dir_len) {
-			// dbg!(curr_file_index);
-			// dbg!(curr_dir_len);
 			data.bottom_bar.slider.set_steps(curr_dir_len as u32, curr_file_index as u32);
 		}
-		//data.slider.set_step_bg(data.playback_manager.cached_from_dir());
 		let playback_state = data.playback_manager.playback_state();
-		data.set_window_title_filename(
-			window,
-			playback_state,
-			data.playback_manager.shown_file_path(),
-		);
-		if prev_texture.is_none() != new_texture.is_none() {
-			data.render_validity.invalidate();
-		} else if let (Some(prev_tex), Some(new_tex)) = (prev_texture, new_texture) {
-			if !Rc::ptr_eq(&prev_tex.tex_grid, &new_tex.tex_grid) {
+		let shown_file_path = data.playback_manager.shown_file_path().clone();
+		data.set_window_title_filename(window, playback_state, &shown_file_path);
+		let bottom_bar_next_update = data.bottom_bar.before_draw();
+		data.next_update = data.next_update.aggregate(bottom_bar_next_update);
+		if let Some(gamma_feedback_until) = data.gamma_feedback_until {
+			data.next_update =
+				data.next_update.aggregate(NextUpdate::WaitUntil(gamma_feedback_until));
+		}
+		if data.thumbnail_mode != StripeMode::Off
+			&& let Some(stripe) = data.thumbnails.clone()
+		{
+			if let (Some(index), Some(len)) = (curr_file_index, curr_dir_len) {
+				let folder = data.playback_manager.path_by_index(index).map(|mut path| {
+					path.pop();
+					path
+				});
+				stripe.set_folder_state(index, len, folder.as_deref());
+			}
+			let bar_visible = data.bottom_bar.is_bar_visible();
+			stripe.set_bottom_offset(if bar_visible { BOTTOM_BAR_HEIGHT } else { 0.0 });
+			let stripe_visible = match data.thumbnail_mode {
+				StripeMode::Pinned => true,
+				StripeMode::AutoHide => bar_visible,
+				StripeMode::Off => false,
+			};
+			if data.stripe_visible != Some(stripe_visible) {
+				data.stripe_visible = Some(stripe_visible);
+				stripe.set_visible(stripe_visible);
+			}
+			if let Some(wanted) = stripe.take_path_requests() {
+				let paths = wanted
+					.into_iter()
+					.filter_map(|index| {
+						data.playback_manager.path_by_index(index).map(|path| (index, path))
+					})
+					.collect::<Vec<_>>();
+				stripe.set_paths(paths);
+			}
+			if stripe.poll(&window.display_mut()) {
 				data.render_validity.invalidate();
 			}
 		}
+		let texture_changed = match (&prev_texture, &new_texture) {
+			(None, Some(_)) => true,
+			(Some(prev_tex), Some(new_tex)) => !Rc::ptr_eq(&prev_tex.tex_grid, &new_tex.tex_grid),
+			_ => false,
+		};
+		if texture_changed {
+			data.adopt_rerendered_svg(prev_texture.as_ref(), new_texture.as_ref());
+			data.render_validity.invalidate();
+			#[cfg(feature = "benchmark")]
+			if let Some(started) = data.benchmark_load_started.take() {
+				println!(
+					"EMULSION_BENCH image_ready_ms={:.3}",
+					started.elapsed().as_secs_f64() * 1000.0
+				);
+			}
+		}
+		data.poll_pending_delete();
 		if let Some(clipboard_handler) = &data.clipboard_handler {
 			let clipboard_result = clipboard_handler.try_get_result();
 			let request_pending = clipboard_result.is_none();
@@ -733,7 +1187,7 @@ impl Widget for PictureWidget {
 				return Ok(data.next_update);
 			}
 			data.update_image_transform(context.dpi_scale_factor);
-			data.apply_camera_movement(context.dpi_scale_factor);
+			data.apply_camera_movement();
 			texture = data.get_texture();
 		}
 		if let Some(texture) = texture {
@@ -757,6 +1211,13 @@ impl Widget for PictureWidget {
 		match event.kind {
 			EventKind::MouseMove => {
 				let mut borrowed = self.data.borrow_mut();
+				if let Some(window) = borrowed.window.upgrade() {
+					let window_height = {
+						let window_ref = window.window_mut();
+						window_ref.inner_size().height as f32 / window_ref.scale_factor() as f32
+					};
+					borrowed.bottom_bar.handle_pointer_move(event.cursor_pos.vec.y, window_height);
+				}
 				borrowed.hover = borrowed.drawn_bounds.contains(event.cursor_pos);
 				if borrowed.panning_2d || borrowed.panning_hor || borrowed.panning_vert {
 					let mut delta = event.cursor_pos - borrowed.last_mouse_pos;
@@ -777,56 +1238,158 @@ impl Widget for PictureWidget {
 				}
 				borrowed.last_mouse_pos = event.cursor_pos;
 			}
-			EventKind::MouseButton { state, button, .. } => match button {
-				MouseButton::Left => {
+			EventKind::MouseButton { state, button, .. } => {
+				log::debug!("Mouse button event: {button:?} {state:?}");
+				#[cfg(target_os = "macos")]
+				if state == ElementState::Pressed
+					&& let Some(direction) = macos_side_button_direction(button)
+				{
 					let mut borrowed = self.data.borrow_mut();
-					if state == ElementState::Pressed {
-						if borrowed.hover {
-							borrowed.click = true;
-							borrowed.panning_2d = true
-						}
+					borrowed.reset_gamma_for_navigation();
+					#[cfg(feature = "benchmark")]
+					Self::benchmark_load_started(&mut borrowed);
+					let request = if direction < 0 {
+						LoadRequest::LoadPrevious
 					} else {
-						borrowed.panning_2d = false;
-						borrowed.click = false;
-						if borrowed.hover {
-							let now = Instant::now();
-							let duration_since_last_click =
-								now.duration_since(borrowed.last_click_time);
-							borrowed.last_click_time = now;
-							if duration_since_last_click < Duration::from_millis(250) {
-								match borrowed.window.upgrade() {
-									Some(window) => {
-										let fullscreen = !window.fullscreen();
-										window.set_fullscreen(fullscreen);
-										borrowed.bottom_bar.set_visible_if_should_show(!fullscreen);
+						LoadRequest::LoadNext
+					};
+					borrowed.playback_manager.request_load(request);
+					borrowed.render_validity.invalidate();
+					return;
+				}
+				match button {
+					MouseButton::Left => {
+						let mut borrowed = self.data.borrow_mut();
+						if state == ElementState::Pressed {
+							let over_overlay = borrowed.pointer_over_overlay(event.cursor_pos);
+							let in_drag_strip = cfg!(target_os = "macos")
+								&& !over_overlay
+								&& event.cursor_pos.vec.y <= MACOS_DRAG_STRIP_HEIGHT
+								&& borrowed
+									.window
+									.upgrade()
+									.is_some_and(|window| !window.fullscreen());
+							if in_drag_strip {
+								let window = borrowed.window.upgrade();
+								// The macOS drag loop pumps events, so the widget must not stay
+								// borrowed while it runs.
+								drop(borrowed);
+								if let Some(window) = window
+									&& let Err(error) = window.drag_window()
+								{
+									log::warn!("Could not start native window drag: {error}");
+								}
+								return;
+							} else if borrowed.hover && !over_overlay {
+								borrowed.click = true;
+								borrowed.panning_2d = true;
+							}
+						} else {
+							borrowed.panning_2d = false;
+							borrowed.click = false;
+							if borrowed.hover
+								&& !borrowed.pointer_over_overlay(event.cursor_pos)
+								&& (!cfg!(target_os = "macos")
+									|| event.cursor_pos.vec.y > MACOS_DRAG_STRIP_HEIGHT)
+							{
+								let now = Instant::now();
+								let is_double_click = now.duration_since(borrowed.last_click_time)
+									< Duration::from_millis(250);
+								// A double click consumes both clicks, so the third click of a
+								// triple click doesn't toggle fullscreen back.
+								borrowed.last_click_time =
+									if is_double_click { long_ago() } else { now };
+								if is_double_click {
+									match borrowed.window.upgrade() {
+										Some(window) => {
+											let fullscreen = !window.fullscreen();
+											window.set_fullscreen(fullscreen);
+											borrowed.bottom_bar.set_fullscreen(fullscreen);
+										}
+										None => log::warn!(
+											"The window is gone; can't toggle fullscreen"
+										),
 									}
-									None => unreachable!(),
 								}
 							}
 						}
+						borrowed.render_validity.invalidate();
 					}
-					borrowed.render_validity.invalidate();
+					MouseButton::Middle => {
+						let mut borrowed = self.data.borrow_mut();
+						if state == ElementState::Pressed
+							&& borrowed.hover
+							&& !borrowed.pointer_over_overlay(event.cursor_pos)
+						{
+							// Middle click toggles between 1:1 and the user's fit mode (Fill or
+							// Best fit) without changing that preference.
+							if borrowed.scaling == ScalingMode::Fixed {
+								let stretch = borrowed.cache.lock().unwrap().image.fit_stretches;
+								borrowed.set_img_size_to_fit(stretch);
+							} else {
+								borrowed.set_img_size_to_orig();
+							}
+						}
+					}
+					MouseButton::Right => {
+						let borrowed = self.data.borrow();
+						let pressed = state == ElementState::Pressed;
+						borrowed.left_to_pan_hint.set_visible(pressed);
+					}
+
+					_ => {}
 				}
-				MouseButton::Right => {
-					let borrowed = self.data.borrow();
-					let pressed = state == ElementState::Pressed;
-					borrowed.left_to_pan_hint.set_visible(pressed);
-				}
-				_ => {}
-			},
+			}
 			EventKind::MouseScroll { delta } => {
 				let mut borrowed = self.data.borrow_mut();
+				// Over the bottom bar the sliders under the pointer own the wheel.
+				if borrowed.pointer_over_bottom_bar(event.cursor_pos) {
+					return;
+				}
+				// A horizontal swipe (MX Master thumb wheel, Logi "Back/Forward" gesture,
+				// trackpad two-finger swipe) steps through the folder instead of zooming,
+				// and so does any scroll over the thumbnail strip.
+				let over_thumbnails = borrowed.pointer_over_thumbnails(event.cursor_pos);
+				if over_thumbnails || delta.vec.x.abs() > delta.vec.y.abs() {
+					let step =
+						if over_thumbnails { delta.vec.x + delta.vec.y } else { delta.vec.x };
+					borrowed.hor_scroll_accum += step;
+					if let Some(direction) = take_swipe_step(&mut borrowed.hor_scroll_accum) {
+						borrowed.reset_gamma_for_navigation();
+						#[cfg(feature = "benchmark")]
+						Self::benchmark_load_started(&mut borrowed);
+						let request = if direction < 0 {
+							LoadRequest::LoadPrevious
+						} else {
+							LoadRequest::LoadNext
+						};
+						borrowed.playback_manager.request_load(request);
+						borrowed.render_validity.invalidate();
+					}
+					return;
+				}
+				borrowed.hor_scroll_accum = 0.0;
 				let delta = delta.vec.y * 0.375;
-				borrowed.zoom_image(event.cursor_pos, delta);
+				// `img_pos` is relative to this widget while the cursor is in window space.
+				let anchor = event.cursor_pos - borrowed.drawn_bounds.pos;
+				borrowed.zoom_image(anchor, delta);
 			}
 			EventKind::KeyInput { ref input } => {
 				let key = input.key_without_modifiers();
 				let is_pressed = input.state == ElementState::Pressed;
-				//println!("Got input for {:?}", key);
 				let input_key_str = virtual_keycode_to_string(&key).to_lowercase();
 				let input_key_str = char_to_input_key(&input_key_str);
 				if is_pressed {
-					self.handle_key_input(input_key_str.as_str(), event.modifiers);
+					let fired = self.handle_key_input(input_key_str.as_str(), event.modifiers);
+					// Non-US layouts report a different logical key for the same physical key
+					// (Czech `[` reports `ú`), so bindings are matched by position too, but only
+					// when the logical key matched nothing: on AZERTY both names can be bound.
+					if !fired
+						&& let Some(physical) = physical_key_to_string(&input.physical_key)
+						&& physical != input_key_str
+					{
+						self.handle_key_input(physical, event.modifiers);
+					}
 				}
 				// Panning is a special snowflake
 				let mut borrowed = self.data.borrow_mut();
@@ -952,9 +1515,7 @@ impl Widget for PictureWidget {
 			EventKind::Focused(focused) => {
 				if focused {
 					let mut borrowed = self.data.borrow_mut();
-					if let Err(e) = borrowed.playback_manager.update_directory() {
-						eprintln!("{}", e);
-					}
+					borrowed.playback_manager.update_directory();
 					borrowed.render_validity.invalidate();
 				}
 			}
@@ -979,14 +1540,6 @@ impl Widget for PictureWidget {
 
 	fn set_valid_ref(&self, render_validity: RenderValidity) {
 		self.data.borrow_mut().render_validity = render_validity;
-	}
-}
-
-impl Drop for PictureWidget {
-	fn drop(&mut self) {
-		// This doesn't work. Would be nice to fix at some point. I think I managed to create a
-		// circular reference with my `Rc`s
-		//println!("Called drop for the picture widget.");
 	}
 }
 
@@ -1043,16 +1596,12 @@ fn draw_tex_grid(
 	let img_translation =
 		Matrix4::from_translation(Vector3::new(img_logical_corner_x, img_logical_corner_y, 0.0));
 
-	// let img_logical_w = img_w / context.dpi_scale_factor;
-	// let img_logical_h = img_h / context.dpi_scale_factor;
 	let cell_phy_step = texture.cell_step_size;
 	for cell_tex in texture.tex_grid.iter() {
 		let (cell_phys_w, cell_phys_h) = cell_tex.tex.dimensions();
 
 		let cell_phy_offset_x = cell_phy_step * cell_tex.col;
 		let cell_phy_offset_y = cell_phy_step * cell_tex.row;
-		// let cell_logical_offset_x = cell_phy_offset_x as f32 / context.dpi_scale_factor;
-		// let cell_logical_offset_y = cell_phy_offset_y as f32 / context.dpi_scale_factor;
 
 		// The grid is constructed so that it is exactly of size (1, 1) and is located at (0, 0)
 		// This allows to leave most of the image transformation logic unchanged.
@@ -1088,12 +1637,14 @@ fn draw_tex_grid(
 		let sampler = sampler.magnify_filter(filter);
 
 		// building the uniforms
-		let lod_level = ((1.0 / data.img_texel_size).log2().max(0.0) + 0.125).floor();
+		let lod_level = lod_for_texel_size(data.img_texel_size);
 		let uniforms = uniform! {
 			matrix: Into::<[[f32; 4]; 4]>::into(transform),
 			bright_shade: data.bright_shade,
+			gamma: data.gamma,
 			tex: sampler,
 			lod_level: lod_level,
+			to_window_gamut: texture.primaries.to_window_matrix(),
 		};
 		target
 			.draw(
@@ -1103,6 +1654,83 @@ fn draw_tex_grid(
 				&uniforms,
 				&image_draw_params,
 			)
-			.unwrap();
+			.unwrap_or_else(|error| log::error!("Could not draw the image: {error}"));
+	}
+}
+
+#[cfg(test)]
+mod lod_tests {
+	use super::*;
+
+	#[test]
+	fn lod_is_zero_when_magnified_or_one_to_one() {
+		assert_eq!(lod_for_texel_size(4.0), 0.0);
+		assert_eq!(lod_for_texel_size(1.0), 0.0);
+	}
+
+	#[test]
+	fn lod_grows_continuously_when_minified() {
+		assert_eq!(lod_for_texel_size(0.5), 1.0);
+		assert_eq!(lod_for_texel_size(0.125), 3.0);
+		let (a, b) = (lod_for_texel_size(0.6), lod_for_texel_size(0.59));
+		assert!(a > 0.0 && b > a && b - a < 0.05);
+		// Far beyond the old 4-level cap.
+		assert!(lod_for_texel_size(MIN_ZOOM_FACTOR) > 13.0);
+	}
+
+	#[test]
+	fn lod_ignores_unfitted_or_broken_scales() {
+		assert_eq!(lod_for_texel_size(0.0), 0.0);
+		assert_eq!(lod_for_texel_size(-1.0), 0.0);
+		assert_eq!(lod_for_texel_size(f32::NAN), 0.0);
+		assert_eq!(lod_for_texel_size(f32::INFINITY), 0.0);
+	}
+}
+
+#[cfg(test)]
+mod svg_tests {
+	use super::*;
+
+	#[test]
+	fn svg_gets_sharper_only_when_magnified_enough() {
+		assert_eq!(sharper_svg_size((1000, 500), 1.0), None);
+		assert_eq!(sharper_svg_size((1000, 500), SVG_SHARPEN_TEXEL_SIZE), None);
+		assert_eq!(sharper_svg_size((1000, 500), 2.0), Some((2000, 1000)));
+		assert_eq!(sharper_svg_size((1000, 500), 4.0), Some((4000, 2000)));
+	}
+
+	/// At the size caps there is nothing sharper to ask for, however far it is zoomed: asking
+	/// again would never end.
+	#[test]
+	fn svg_stops_getting_sharper_at_the_caps() {
+		assert_eq!(sharper_svg_size((16384, 1000), 8.0), None);
+		assert_eq!(sharper_svg_size((8192, 8192), 8.0), None);
+		assert!(sharper_svg_size((4096, 4096), 8.0).is_some());
+	}
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn macos_side_buttons_cover_native_and_driver_events() {
+		assert_eq!(macos_side_button_direction(MouseButton::Back), Some(-1));
+		assert_eq!(macos_side_button_direction(MouseButton::Forward), Some(1));
+		assert_eq!(macos_side_button_direction(MouseButton::Other(3)), Some(-1));
+		assert_eq!(macos_side_button_direction(MouseButton::Other(4)), Some(1));
+	}
+
+	#[test]
+	fn swipe_steps_once_per_threshold_and_keeps_direction() {
+		let mut accumulated = 0.0;
+		accumulated += 0.9;
+		assert_eq!(take_swipe_step(&mut accumulated), None);
+		accumulated += 1.2;
+		assert_eq!(take_swipe_step(&mut accumulated), Some(-1));
+		assert_eq!(accumulated, 0.0);
+		accumulated -= 2.5;
+		assert_eq!(take_swipe_step(&mut accumulated), Some(1));
+		assert_eq!(take_swipe_step(&mut accumulated), None);
 	}
 }
