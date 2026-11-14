@@ -1,5 +1,148 @@
 ## Unreleased
 
+### Added
+- Middle click on the image toggles between 1:1 and the current fit mode (Fill or Best fit)
+  without changing it; middle click on the gamma slider resets gamma
+- macOS: HEIC/HEIF (iPhone photos) open and get thumbnails through ImageIO with their
+  orientation; camera RAW files (CR2, CR3, NEF, ARW, DNG, RAF, ORF, RW2, PEF, SRW) show their
+  embedded preview; AVIF opens without the `avif` feature
+- macOS: wide-gamut output. The window is Display P3, so P3 photos keep their colours instead
+  of being clipped to sRGB; sRGB/untagged images are mapped on the GPU at no extra cost
+- SVGs render at the window's size instead of a fixed 4096 px and re-render sharper when
+  zoomed in (up to 16384 px), keeping the current picture on screen meanwhile
+- macOS and Windows show a native error dialog when Emulsion can't start (no OpenGL 3.3)
+- Scrolling over an overlay acts on that overlay: the gamma slider changes gamma, the folder
+  bar and the thumbnail strip step through the images; only the image itself zooms
+- macOS: `./distribution/macos/create_signing_cert.sh` creates a local code signing identity;
+  `create_dmg.sh` uses it automatically (or `CODESIGN_IDENTITY`), so the Files and Folders
+  permission stays granted across rebuilds instead of being re-asked for every ad-hoc build
+- macOS: Files and Folders usage descriptions in the bundle, so the permission prompt explains
+  that Emulsion lists the folder for previous/next navigation
+- `-` / `+` are bound to gamma decrease / increase next to `[` / `]`
+
+### Changed
+- New installs fill the window with the image (`E` switches back to best fit)
+- macOS: the bundle claims the image types with `LSHandlerRank = Default`, so Emulsion is
+  offered first in "Open With" and as the default viewer
+- Rust 1.100; resvg/usvg 0.50, muda 0.21, objc2 0.6 (AppKit/Foundation 0.3), and the
+  remaining dependencies updated to their latest compatible releases
+- Key bindings with modifiers now require them: `Cmd+O`, `Shift+X`, `Control+X` and
+  `Super+X` no longer fire on the bare key. Unknown modifiers are logged and the binding is
+  ignored; `Ctrl++` binds plus. Bindings without `Shift+` still fire with Shift held
+- Releases are built with `--locked` after the test suite passes; CI lints the whole workspace
+  on Linux and macOS and checks the AVIF build
+- Dropped the `lazy_static`, `backtrace` and `sys-info` dependencies (std `LazyLock`,
+  `std::backtrace`, `libc`/`windows-sys` for total memory), unused gelatin API and dead
+  commented-out code. No C toolchain is needed any more, so the workspace cross-checks for
+  Linux and Windows from a Mac
+
+### Fixed
+- macOS: opening an image from Finder works again. The document handling now lives on the
+  application delegate (`application:openFile:`), which is where `NSApplication` routes the
+  `odoc` Apple Event; the previous Apple Event handler was replaced during launch, so
+  LaunchServices reported that Emulsion cannot open files in the Image format
+- Double-clicking the gamma slider only resets gamma; the second click no longer also moves
+  the slider to the pointer
+- Thumbnails were uploaded upside down and ignored EXIF orientation; they now match the image
+- Thumbnails decode on up to four workers with a box-sampled downscale, so a strip of twelve
+  20 MP JPEGs fills in ~86 ms instead of ~510 ms
+- Launching without an image no longer pops an Open dialog over the empty window; use
+  File → Open
+- SVGs render with correct transparency; semi-transparent areas and anti-aliased edges were
+  darkened (premultiplied output read as straight alpha)
+- SVGs smaller than 512 bytes, or with an upper-case `.SVG` extension, open again
+- SVG thumbnails appear in the filmstrip; the current image's cell no longer turns into a
+  solid yellow block while its thumbnail is missing
+- Icons, labels, thumbnails and the help screen no longer darken their translucent edges
+  (alpha was applied twice)
+- System fonts are scanned once per session instead of for every SVG
+- Downscaled icons, labels, thumbnails and the help screen sample their mipmaps instead of
+  aliasing on non-Retina and fractionally scaled displays
+- The new-version button and `--help` point to this fork instead of the discontinued
+  upstream site; a failure to open the browser is logged instead of crashing
+- macOS: colours are no longer oversaturated on wide-gamut screens. The window was untagged,
+  so sRGB pixels were shown as P3 and skin tones leaned red; it is now tagged and colour-matched
+- Images with an embedded ICC profile (Display P3, Adobe RGB, ...) are converted to the window
+  gamut, in the main view and the thumbnails (~7 ms for 24 MP; sRGB and untagged files skip it).
+  A profile is only skipped when both its primaries and its tone curve match, so DCI-P3
+  (gamma 2.6) or gamma-2.2 "sRGB" files are converted correctly
+- Crashes: dropping, hovering or opening a non-image file next to images; empty folders;
+  a decoder panic (the image now shows an error instead of loading forever); a failed
+  neighbour prefetch during slideshows; zooming before the first image is shown; missing
+  OpenGL 3.3 (now a clear error); a full disk when saving the cache on quit
+- The cache is written atomically, a broken cache no longer shows the first-launch help, and
+  config/cache parse errors are logged with the file and reason. An `[updates]` section
+  without `check_updates` no longer discards the whole config
+- The update check times out after 10 s and never delays quitting
+- CPU: loader threads and the folder watcher no longer poll or spin, animations no longer
+  busy-wait before each frame (a 10 fps GIF went from ~9% to ~2% CPU), and pointer moves no
+  longer redraw the whole window because of the title or thumbnail strip
+- Cache: focus changes and deletes keep the decoded neighbours, eviction keeps the images
+  closest to the current one, prefetch looks both ways and honours the memory budget for
+  huge images, and a file changed on disk is reloaded
+- Zoomed-out images use a full mipmap chain with smooth level blending (no shimmer or
+  popping), and transparent images no longer get dark fringes when minified
+- 16-bit images are colour-converted at 16 bits; HDR/EXR images are tone-mapped and
+  sRGB-encoded instead of clipped and too dark
+- Keys no longer trigger two actions on non-US layouts (AZERTY); custom commands run in the
+  background instead of freezing the window
+- The thumbnail strip refreshes when switching to a folder with the same number of images,
+  and evicted thumbnails load again when they scroll back into view
+- Triple click no longer toggles fullscreen twice; scroll zoom anchors on the cursor
+- Redraw on display scale changes; no 1 px drift at fractional scales
+- Linux: the Wayland app id / X11 `WM_CLASS` are set again and the Wayland-only passes run
+  only on Wayland
+- `panic.txt` is capped at 1 MiB; clipboard copy of rotated images uses less memory
+- Windows installer: VC++ runtime installs silently and is verified, uninstall removes
+  everything; macOS: `create_signing_cert.sh` works with the stock LibreSSL `openssl`
+- Prefetching an animation decodes only its first frame; the rest loads when it is shown.
+  Requests that are no longer wanted stop decoding and free their slot right away
+- Folder listing runs in the background, so large or network folders no longer freeze the
+  window; file order is deterministic
+- Moving an image to the Trash no longer blocks the window, menu and key use the same delete
+  and copy code, and a failed delete shows the on-screen failure icon
+- Keyboard panning is no longer twice as fast on Retina displays
+- Windows/Linux: camera RAW files are no longer listed, since they can't be decoded there
+- A failed move to Trash shows its own "Failed to Delete" notification
+
+## 13.0.0
+
+First release of the `stmr/emulsion` fork (upstream is discontinued).
+
+### Added
+- macOS: native menu bar (App, File, Edit, View, Window, Help) that dispatches the same
+  actions as the configurable key bindings
+- macOS: Finder integration (document types in the bundle, `odoc`/`rapp` Apple Events,
+  opening an image in the running window, native Open dialog when launched with no image)
+- macOS: borderless window with the real traffic lights, revealed on pointer proximity in the
+  top-left corner and hidden again after 800 ms; slim top strip drags the window
+- macOS: `quit_on_close` config option; by default the red button closes the window and the
+  app stays running
+- macOS: Mouse Back / Mouse Forward navigate to the previous / next image
+- Nondestructive gamma (0.25–4.0, neutral 1.0) with a logarithmic slider centered on 1.0,
+  `[` / `]` / `\` bindings, double-click reset, and the `image.gamma` /
+  `image.reset_gamma_on_navigation` config options
+- Appearance follows the desktop theme on new installs; switching the theme in the app keeps
+  the manual choice
+- Universal 2 (arm64 + x86_64) macOS build script with AVIF, pinned deployment target 11.0,
+  ad-hoc signing, and DMG packaging: `./distribution/macos/create_dmg.sh`
+- Horizontal swipe / thumb-wheel navigation, so Logitech's Back/Forward *gesture* assignment
+  (the MX Master default) steps through the folder; `BrowserBack`/`BrowserForward` and
+  `Cmd+[` / `Cmd+]` are bound to the same actions for drivers that send keystrokes
+- Optional folder filmstrip: `T` (or View → Cycle Thumbnails) cycles off → auto-hide → pinned,
+  the mode is remembered, cells are 96 pt by default (`window.thumbnail_size`), decoding happens
+  off the UI thread, and the cache is capped at `min(5% of RAM, 512 MiB)`
+
+### Changed
+- The bottom bar is now an overlay above the image: hidden by default, revealed near the
+  bottom edge, hidden again after 800 ms. `window.show_bottom_bar = true` pins it,
+  `false` disables it entirely
+- Bundle identifier is now `io.github.stmr.emulsion` and the bundle uses the `.icns` icon
+- Rust 2024 edition, pinned toolchain (`rust-toolchain.toml`), refreshed dependencies
+  (thiserror 2, rand 0.10, toml 1, trash 5, resvg/usvg 0.48, kamadak-exif 0.6, ureq 3,
+  derive_builder 0.20)
+- Release workflow publishes only on `v*` tags and uploads build artifacts otherwise
+
 ## 12.0 on 2026-04-02
 
 ### Changed
