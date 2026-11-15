@@ -6,7 +6,10 @@ A note for Linux users: Wayland is less tested than X (older releases had high C
 title text there); X is fully supported.
 
 macOS builds are Universal 2 (Apple Silicon + Intel), require macOS 11 or newer, and are not
-notarized: right-click the app and choose Open on first launch.
+notarized, so macOS refuses the first launch ("could not verify"). On macOS 15 and newer, open
+System Settings → Privacy & Security, scroll to Security and click **Open Anyway** next to
+Emulsion (on older macOS: right-click the app → Open). Alternatively, after moving it to
+Applications: `xattr -dr com.apple.quarantine /Applications/Emulsion.app`.
 
 ### macOS specifics
 
