@@ -132,7 +132,8 @@ jobs:
         if-no-files-found: error
 
   osx:
-    runs-on: macos-14
+    # macos-14 has been retired; macos-latest is the arm64 image the tests run on.
+    runs-on: macos-latest
     needs: test
     env:
       INSTALLER_NAME: ${{ format('Emulsion-OSX-{0}.dmg', github.ref_name) }}
