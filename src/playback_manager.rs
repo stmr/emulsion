@@ -19,6 +19,15 @@ use crate::image_cache::{
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 
+/// How soon to look again for an image the loader threads decode or for a prefetch to upload:
+/// the result can't wake the UI, so it shows up at most this late.
+const LOAD_POLL: Duration = Duration::from_millis(4);
+/// The first image waits for its folder's listing, which takes a few ms for ordinary folders.
+const LISTING_POLL: Duration = Duration::from_millis(2);
+/// The most memory the cache may use, whatever the amount of RAM: prefetching further than a
+/// few images ahead costs far more memory than it saves waiting.
+const MAX_CACHE_BYTES: isize = 1_000_000_000;
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum LoadRequest {
 	None,
@@ -147,7 +156,7 @@ pub struct PlaybackManager {
 impl PlaybackManager {
 	pub fn new() -> Self {
 		let cache_capaxity = match crate::system_memory::total_memory_bytes() {
-			Some(total) => (total / 8) as isize,
+			Some(total) => ((total / 8) as isize).min(MAX_CACHE_BYTES),
 			None => {
 				eprintln!("Could not get system memory size, using default value");
 				// bytes
@@ -402,11 +411,21 @@ impl<P: Playback> ImgSequencePlayer<P> {
 			match load_request {
 				LoadRequest::Jump(0) => {
 					// Waiting on current image to be loaded.
-					next_update = gelatin::NextUpdate::WaitUntil(few_millisecs_from_now);
+					next_update = gelatin::NextUpdate::WaitUntil(now + LOAD_POLL);
 				}
 				_ => {
-					image_cache.prefetch_neighbors();
-					next_update = gelatin::NextUpdate::Latest;
+					// With a load request pending the prefetch has to wait for the image to
+					// be shown: evicting and requesting neighbours first delays it, and
+					// they would be the neighbours of the previous image.
+					if load_request == LoadRequest::None {
+						image_cache.prefetch_neighbors();
+					}
+					// Prefetched images are uploaded as they arrive.
+					next_update = if image_cache.has_pending_requests() {
+						gelatin::NextUpdate::WaitUntil(now + LOAD_POLL)
+					} else {
+						gelatin::NextUpdate::Latest
+					};
 				}
 			}
 		} else if load_request == LoadRequest::None {
@@ -505,18 +524,22 @@ impl<P: Playback> ImgSequencePlayer<P> {
 					Ok(frame) => {
 						self.image_texture = Some(frame);
 						self.file_path = LoadedImgPath::Loaded(path);
+						if self.playback_state == PlaybackState::Paused {
+							// The prefetch starts at the next look, after this frame is drawn.
+							next_update = gelatin::NextUpdate::WaitUntil(now + LOAD_POLL);
+						}
 					}
 					Err(image_cache::TextureError::WaitingOnLoader) => {
 						// Set the load request to jump in place so that
 						// next time we attempt to load this again.
 						self.load_request = LoadRequest::Jump(0);
-						next_update = gelatin::NextUpdate::WaitUntil(few_millisecs_from_now);
+						next_update = gelatin::NextUpdate::WaitUntil(now + LOAD_POLL);
 					}
 					Err(image_cache::TextureError::WaitingOnListing) => {
 						// The folder of this file is being listed. Ask for the same file again
 						// (not the current one, which is still the previous folder's).
 						self.load_request = LoadRequest::FilePath(path);
-						next_update = gelatin::NextUpdate::WaitUntil(few_millisecs_from_now);
+						next_update = gelatin::NextUpdate::WaitUntil(now + LISTING_POLL);
 					}
 					Err(err) => {
 						self.image_texture = None;
@@ -528,7 +551,7 @@ impl<P: Playback> ImgSequencePlayer<P> {
 					// Set the load request to jump in place so that
 					// next time we attempt to load this again.
 					self.load_request = LoadRequest::Jump(0);
-					next_update = gelatin::NextUpdate::WaitUntil(few_millisecs_from_now);
+					next_update = gelatin::NextUpdate::WaitUntil(now + LOAD_POLL);
 				}
 				Err(PathResolutionError::NotYetSpecified) => {
 					self.image_texture = None;

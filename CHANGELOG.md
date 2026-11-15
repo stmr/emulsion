@@ -1,3 +1,14 @@
+## 14.0.1
+
+### Fixed
+- Opening an image is faster than in 14.0.0 and v12.3: the opened file is decoded while its
+  folder is still being listed instead of after, files with an image extension are no longer
+  read during listing, and loading is checked every few ms instead of every 50 ms
+  (24 MP JPEG in a 20-file folder: 429 ms in 14.0.0, 239 ms in v12.3, 221 ms now)
+- Neighbours are prefetched only after the shown image is ready, so they no longer delay it
+- The image cache is capped at 1 GB, bringing memory use back to v12.3's level for photo
+  folders
+
 ## 14.0.0
 
 Major version because key bindings with modifiers now require them (see Changed), which can

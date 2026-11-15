@@ -80,6 +80,9 @@ pub struct Directory {
 	/// Maps request ids to indicies for the `files` vector.
 	file_idx_by_req: HashMap<u32, usize>,
 
+	/// Ids given out for files of folders that are not listed yet, see `reserve_request_id`.
+	reserved: HashMap<PathBuf, u32>,
+
 	/// current file index
 	/// This must never be exposed to users of this object.
 	curr_file_idx: usize,
@@ -167,10 +170,20 @@ impl Directory {
 			curr_image_idx: 0,
 			current_req_id: 0,
 			file_idx_by_req: HashMap::new(),
+			reserved: HashMap::new(),
 			pending: None,
 			failed: None,
 			lister: ParallelAction::new(list_directory),
 		}
+	}
+
+	/// A request id for `path`, a file of a folder that is not listed yet, so that the file can
+	/// be decoded while the folder is listed. The listing gives the file the same id.
+	pub fn reserve_request_id(&mut self, path: PathBuf) -> u32 {
+		*self.reserved.entry(path).or_insert_with(|| {
+			self.current_req_id += 1;
+			self.current_req_id
+		})
 	}
 
 	fn request_listing(&mut self, path: &Path) {
@@ -262,8 +275,11 @@ impl Directory {
 
 		// Files that were already listed keep their request id so that their cached textures
 		// stay valid across a refresh of the directory.
-		let known_ids: HashMap<PathBuf, u32> =
+		let mut known_ids: HashMap<PathBuf, u32> =
 			std::mem::take(&mut self.files).into_iter().map(|d| (d.path, d.request_id)).collect();
+		for (path, request_id) in self.reserved.drain() {
+			known_ids.entry(path).or_insert(request_id);
+		}
 		self.files = files
 			.into_iter()
 			.map(|path| {

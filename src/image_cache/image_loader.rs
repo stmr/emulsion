@@ -634,7 +634,8 @@ fn load_animation(
 	})
 }
 
-pub fn is_file_supported(filename: &Path) -> bool {
+/// Whether the file extension alone says the file is an image: it doesn't touch the file.
+pub fn has_image_extension(filename: &Path) -> bool {
 	// Only macOS can decode RAW; elsewhere their TIFF header would list them as broken entries.
 	if has_extension(filename, &RAW_EXTENSIONS) {
 		return cfg!(target_os = "macos");
@@ -654,6 +655,17 @@ pub fn is_file_supported(filename: &Path) -> bool {
 			"avif" => return true,
 			_ => (),
 		}
+	}
+	false
+}
+
+pub fn is_file_supported(filename: &Path) -> bool {
+	if has_image_extension(filename) {
+		return true;
+	}
+	// RAW files are not decodable elsewhere, whatever their content says.
+	if has_extension(filename, &RAW_EXTENSIONS) {
+		return false;
 	}
 	detect_format(filename).is_ok()
 }
@@ -1147,6 +1159,15 @@ mod tests {
 		{
 			assert_eq!(is_file_supported(Path::new(name)), cfg!(target_os = "macos"), "{name}");
 		}
+	}
+
+	/// The extension check never touches the file: these paths don't exist.
+	#[test]
+	fn image_extensions_are_recognised_without_reading_the_file() {
+		assert!(has_image_extension(Path::new("/nope/photo.JPG")));
+		assert!(has_image_extension(Path::new("/nope/anim.gif")));
+		assert!(!has_image_extension(Path::new("/nope/notes.txt")));
+		assert!(!has_image_extension(Path::new("/nope/no_extension")));
 	}
 
 	#[cfg(target_os = "macos")]

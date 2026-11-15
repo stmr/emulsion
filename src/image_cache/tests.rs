@@ -254,6 +254,24 @@ fn opening_a_file_in_another_folder_selects_it_once_listed() {
 	assert!(dir.change_directory_with_filename(second.path(), OsStr::new("missing.png")).is_err());
 }
 
+/// The opened file is decoded under an id handed out before its folder is listed; the listing
+/// must give the file that id, and a reserved id is stable until then.
+#[test]
+fn a_reserved_request_id_is_kept_by_the_listing() {
+	let folder = TempDir::new(&["a.png", "b.png", "c.png"]);
+	let mut dir = Directory::new();
+	assert!(!dir.change_directory_with_filename(folder.path(), OsStr::new("b.png")).unwrap());
+	let b = folder.path().join("b.png");
+	let reserved = dir.reserve_request_id(b.clone());
+	assert_eq!(dir.reserve_request_id(b), reserved);
+	wait_for_listing(&mut dir);
+
+	assert_eq!(request_id_of(&dir, "b.png"), reserved);
+	assert!(dir.has_request(reserved));
+	let others = [request_id_of(&dir, "a.png"), request_id_of(&dir, "c.png")];
+	assert!(others.iter().all(|id| *id != reserved));
+}
+
 #[test]
 fn only_the_last_requested_folder_is_applied() {
 	let first = TempDir::new(&["a.png"]);

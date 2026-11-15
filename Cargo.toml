@@ -1,6 +1,6 @@
 [package]
 name = "emulsion"
-version = "14.0.0"
+version = "14.0.1"
 description = "A fast and minimalistic image viewer"
 repository = "https://github.com/stmr/emulsion"
 authors = ["Artur Barnabas <kovacs.artur.barnabas@gmail.com>", "The Emulsion Contributors"]

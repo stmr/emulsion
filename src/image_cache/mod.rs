@@ -1,6 +1,6 @@
 use std::{
 	borrow::Cow,
-	collections::{BTreeMap, HashSet},
+	collections::{BTreeMap, HashMap, HashSet},
 	ffi::OsString,
 	fs,
 	path::{Path, PathBuf},
@@ -431,6 +431,9 @@ pub struct ImageCache {
 	loader: ImageLoader,
 	/// The box SVG requests are rendered to fit, see `set_svg_view`.
 	svg_view: (u32, u32),
+	/// What `estimate_file_size` found for a request id: it reads the file, and prefetching
+	/// asks again at every tick while the budget is used up.
+	size_estimates: HashMap<u32, isize>,
 }
 
 /// This is a store for the supported images loaded from a folder
@@ -452,6 +455,7 @@ impl ImageCache {
 			texture_cache: BTreeMap::new(),
 			loader: ImageLoader::new(threads),
 			svg_view: SVG_DEFAULT_FIT,
+			size_estimates: HashMap::new(),
 		}
 	}
 
@@ -572,6 +576,7 @@ impl ImageCache {
 		let dir = &self.dir;
 		self.texture_cache.retain(|req_id, _| dir.has_request(*req_id));
 		self.pending_requests.retain(|req_id| dir.has_request(req_id));
+		self.size_estimates.retain(|req_id, _| dir.has_request(*req_id));
 
 		// The files may have changed since they were decoded: they are all
 		// checked against the modification time of the file system file.
@@ -643,7 +648,19 @@ impl ImageCache {
 			None => self.dir.change_directory(&parent)?,
 		};
 		if !listed {
-			// The previous listing stays in use meanwhile; the caller asks again.
+			// The opened file is decoded meanwhile; the previous listing stays in use and the
+			// caller asks again.
+			if let Some(file_name) = &target_file_name {
+				let file_path = parent.join(file_name);
+				if has_image_extension(&file_path) {
+					let req_id = self.dir.reserve_request_id(file_path.clone());
+					self.send_request_for_file(
+						file_path,
+						req_id,
+						RequestKind::Priority { display },
+					);
+				}
+			}
 			return Err(TextureError::WaitingOnListing);
 		}
 		if target_file_name.is_none() {
@@ -665,7 +682,14 @@ impl ImageCache {
 				retval
 			}
 		};
-		self.refresh_cache();
+		// Evicting textures stalls the frame by a few ms. When the target is cached already
+		// nothing is added, so that waits for the next `prefetch_neighbors`.
+		let target_cached = self
+			.curr_dir_item()
+			.is_some_and(|item| self.texture_cache.contains_key(&item.request_id));
+		if !target_cached {
+			self.refresh_cache();
+		}
 		self.try_getting_requested_image(display, requested_frame_id)
 	}
 
@@ -965,13 +989,24 @@ impl ImageCache {
 	/// Requests the images around the current one, nearest first, alternating sides
 	/// (+1, -1, +2, -2, ...) and wrapping around like next/previous do. Images that are
 	/// already cached or requested are skipped; it stops when the budget or the limit
-	/// of pending requests is reached.
+	/// of pending requests is reached. Nothing is requested before the current image is
+	/// loaded: prefetches would take the decoder threads and the pending-request slots the
+	/// shown image needs, and delay it.
 	pub fn prefetch_neighbors(&mut self) {
 		self.sync_directory();
 		let (Some(curr_index), Some(count)) = (self.dir.curr_img_index(), self.dir.image_count())
 		else {
 			return;
 		};
+		let current_loaded = self.curr_dir_item().is_some_and(|item| {
+			self.texture_cache
+				.get(&item.request_id)
+				.is_some_and(|tex| tex.fully_loaded && !tex.truncated && !tex.replacing)
+		});
+		if !current_loaded {
+			return;
+		}
+		self.refresh_cache();
 		for index in prefetch_order(curr_index, count) {
 			if self.prefetch_index(index) == SendOutcome::Blocked {
 				return;
@@ -1037,6 +1072,7 @@ impl ImageCache {
 		}
 		if cache_enty_invalid {
 			self.texture_cache.remove(&req_id);
+			self.size_estimates.remove(&req_id);
 		}
 		if priority {
 			self.loader.set_priority(req_id);
@@ -1044,7 +1080,8 @@ impl ImageCache {
 		if self.pending_requests.contains(&req_id) {
 			return SendOutcome::Skipped;
 		}
-		let reserved = estimate_file_size(&file_path);
+		let reserved =
+			*self.size_estimates.entry(req_id).or_insert_with(|| estimate_file_size(&file_path));
 		if !priority && reserved > self.remaining_capacity() {
 			return SendOutcome::Blocked;
 		}
