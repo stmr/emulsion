@@ -170,7 +170,7 @@ jobs:
     needs: test
     env:
       EMULSION_VERSION: ${{ github.ref_name }}
-      INSTALLER_NAME: ${{ format('Emulsion-Linux.deb-{0}.deb', github.ref_name) }}
+      INSTALLER_NAME: ${{ format('Emulsion-Linux-{0}.deb', github.ref_name) }}
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -197,8 +197,7 @@ jobs:
         CARGO_BUNDLE_SKIP_BUILD=1 cargo bundle --release --features=avif
     - name: Rename .deb
       run: |
-        mv target/release/bundle/deb/*.deb Emulsion.deb
-        mv Emulsion.deb "$INSTALLER_NAME"
+        mv target/release/bundle/deb/*.deb "$INSTALLER_NAME"
     - name: Upload Linux package
       uses: actions/upload-artifact@v4
       with:
