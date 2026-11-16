@@ -242,6 +242,35 @@ pub fn detect_orientation(path: &Path) -> std::result::Result<Orientation, exif:
 	}
 }
 
+/// `into_rgba8`, with large RGB8 images (JPEG, most PNG photos) converted on all cores: the
+/// serial pass takes ~40 ms for 100 megapixels, and the image is not shown before it is done.
+fn rgba8_from(image: image::DynamicImage) -> image::RgbaImage {
+	const PARALLEL_MIN_PIXELS: usize = 4 << 20;
+	let image::DynamicImage::ImageRgb8(rgb) = image else {
+		return image.into_rgba8();
+	};
+	let (width, height) = rgb.dimensions();
+	let pixels = width as usize * height as usize;
+	if pixels < PARALLEL_MIN_PIXELS {
+		return image::DynamicImage::ImageRgb8(rgb).into_rgba8();
+	}
+	// Zeroed memory comes from the OS lazily, so the pages are first touched by the workers.
+	let mut rgba = vec![0u8; pixels * 4];
+	let workers = thread::available_parallelism().map_or(1, |n| n.get());
+	let part = pixels.div_ceil(workers);
+	thread::scope(|scope| {
+		for (src, dst) in rgb.as_raw().chunks(part * 3).zip(rgba.chunks_mut(part * 4)) {
+			scope.spawn(move || {
+				for (src, dst) in src.as_chunks::<3>().0.iter().zip(dst.as_chunks_mut::<4>().0) {
+					dst[..3].copy_from_slice(src);
+					dst[3] = 255;
+				}
+			});
+		}
+	});
+	image::RgbaImage::from_raw(width, height, rgba).expect("the buffer holds every pixel")
+}
+
 /// Decodes `path` with the `image` crate. The pixels come back in the window's gamut or in sRGB
 /// (see `Primaries`).
 pub fn simple_load_image(
@@ -272,7 +301,7 @@ pub fn simple_load_image(
 			(image, primaries)
 		}
 		(image, icc) => {
-			let mut image = image.into_rgba8();
+			let mut image = rgba8_from(image);
 			let primaries = match icc {
 				Some(icc) => convert_to_window_space(&mut image, &icc),
 				None => Primaries::Srgb,
@@ -539,16 +568,31 @@ where
 				truncated = process_frames(animation, allow_animation, &mut process_image)?;
 			} else {
 				let (image, primaries) = simple_load_image(path, ImageFormat::Png)?;
-				process_image(LoadResult::still(req_id, image, orientation, primaries, false))?;
+				process_image(LoadResult::still(
+					req_id,
+					image,
+					orientation,
+					primaries,
+					false,
+					false,
+				))?;
 			}
 		}
 		ImgFormat::Image(image_format) => {
 			let (image, primaries) = simple_load_image(path, image_format)?;
-			process_image(LoadResult::still(req_id, image, orientation, primaries, false))?;
+			let opaque = image_format == ImageFormat::Jpeg;
+			process_image(LoadResult::still(req_id, image, orientation, primaries, false, opaque))?;
 		}
 		ImgFormat::Svg => {
 			let image = load_svg(path, svg_fit)?;
-			process_image(LoadResult::still(req_id, image, orientation, Primaries::Srgb, true))?;
+			process_image(LoadResult::still(
+				req_id,
+				image,
+				orientation,
+				Primaries::Srgb,
+				true,
+				false,
+			))?;
 		}
 		// ImageIO knows the orientation of these better than the EXIF reader (HEIF `irot`).
 		#[cfg(target_os = "macos")]
@@ -556,7 +600,7 @@ where
 			let (image, orientation) =
 				system_decoder::load(path, matches!(image_format, ImgFormat::Raw))?;
 			let primaries = Primaries::DisplayP3;
-			process_image(LoadResult::still(req_id, image, orientation, primaries, false))?;
+			process_image(LoadResult::still(req_id, image, orientation, primaries, false, false))?;
 		}
 	}
 
@@ -629,6 +673,7 @@ fn load_animation(
 				orientation: Orientation::Deg0,
 				primaries: Primaries::Srgb,
 				svg: false,
+				opaque: false,
 			}
 		})?)
 	})
@@ -715,6 +760,9 @@ pub enum LoadResult {
 		primaries: Primaries,
 		/// Rendered from an SVG, so it can be rendered again at another size.
 		svg: bool,
+		/// The format has no alpha channel (JPEG): the texture upload needn't look for
+		/// translucent texels.
+		opaque: bool,
 	},
 	Done {
 		req_id: u32,
@@ -733,8 +781,9 @@ impl LoadResult {
 		orientation: Orientation,
 		primaries: Primaries,
 		svg: bool,
+		opaque: bool,
 	) -> Self {
-		LoadResult::Frame { req_id, image, delay_nano: 0, orientation, primaries, svg }
+		LoadResult::Frame { req_id, image, delay_nano: 0, orientation, primaries, svg, opaque }
 	}
 
 	pub fn req_id(&self) -> u32 {
@@ -1225,5 +1274,17 @@ mod tests {
 		assert_eq!(run(3, false), (1, true));
 		assert_eq!(run(1, false), (1, false));
 		assert_eq!(run(3, true), (3, false));
+	}
+
+	/// The multi-core conversion gives the same pixels as `into_rgba8`, including a ragged tail
+	/// that doesn't divide among the workers.
+	#[test]
+	fn large_rgb_images_convert_like_into_rgba8() {
+		let (width, height) = (2101, 2003);
+		let rgb = image::RgbImage::from_fn(width, height, |x, y| {
+			image::Rgb([x as u8, (y % 251) as u8, (x ^ y) as u8])
+		});
+		let expected = image::DynamicImage::ImageRgb8(rgb.clone()).into_rgba8();
+		assert_eq!(rgba8_from(image::DynamicImage::ImageRgb8(rgb)), expected);
 	}
 }

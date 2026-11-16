@@ -65,6 +65,34 @@ fn lod_for_texel_size(texel_size: f32) -> f32 {
 	if texel_size > 0.0 { (-texel_size.log2()).max(0.0) } else { 0.0 }
 }
 
+/// How texels are filtered when the picture is magnified: `Auto` shows real pixels (nearest) once
+/// a texel covers `AA_TEXEL_SIZE_THRESHOLD` physical pixels and smooth (linear) below that.
+fn magnify_filter(antialiasing: Antialias, texel_size: f32) -> MagnifySamplerFilter {
+	match antialiasing {
+		Antialias::Auto if texel_size < AA_TEXEL_SIZE_THRESHOLD => MagnifySamplerFilter::Linear,
+		Antialias::Auto | Antialias::Never => MagnifySamplerFilter::Nearest,
+		Antialias::Always => MagnifySamplerFilter::Linear,
+	}
+}
+
+/// The texel size after a zoom step of `delta` (wheel or key input; positive zooms in). It
+/// snaps to exactly 1:1 when close to it and stays within the zoom limits.
+fn zoomed_texel_size(texel_size: f32, delta: f32) -> f32 {
+	let delta = if delta > 0.0 { delta + 1.0 } else { 1.0 / (delta.abs() + 1.0) };
+	let new_size = (texel_size * delta).max(0.0);
+	if (new_size - 1.0).abs() < 0.01 {
+		1.0
+	} else {
+		new_size.clamp(MIN_ZOOM_FACTOR, MAX_ZOOM_FACTOR)
+	}
+}
+
+/// The image centre after the picture is scaled by `ratio` about `anchor`. Both are relative
+/// to the picture widget, so the point of the image under `anchor` stays under it.
+fn zoomed_img_pos(img_pos: LogicalVector, anchor: LogicalVector, ratio: f32) -> LogicalVector {
+	ratio * (img_pos - anchor) + anchor
+}
+
 /// An SVG texture is magnified up to this many physical pixels per texel before it is rendered
 /// again.
 const SVG_SHARPEN_TEXEL_SIZE: f32 = 1.5;
@@ -301,19 +329,13 @@ impl PictureWidgetData {
 		}
 	}
 
-	fn zoom_image(&mut self, anchor: LogicalVector, mut delta: f32) {
+	fn zoom_image(&mut self, anchor: LogicalVector, delta: f32) {
 		if self.img_texel_size <= 0.0 {
 			// Nothing has been fitted yet, so there is no scale to zoom from.
 			return;
 		}
-		delta = if delta > 0.0 { delta + 1.0 } else { 1.0 / (delta.abs() + 1.0) };
-		let mut image_texel_size = (self.img_texel_size * delta).max(0.0);
-		if (image_texel_size - 1.0).abs() < 0.01 {
-			image_texel_size = 1.0;
-		} else {
-			image_texel_size = image_texel_size.clamp(MIN_ZOOM_FACTOR, MAX_ZOOM_FACTOR)
-		}
-		self.img_pos = (image_texel_size / self.img_texel_size) * (self.img_pos - anchor) + anchor;
+		let image_texel_size = zoomed_texel_size(self.img_texel_size, delta);
+		self.img_pos = zoomed_img_pos(self.img_pos, anchor, image_texel_size / self.img_texel_size);
 		self.img_texel_size = image_texel_size;
 		self.scaling = ScalingMode::Fixed;
 		self.update_scaling_buttons();
@@ -1627,14 +1649,8 @@ fn draw_tex_grid(
 			.minify_filter(gelatin::glium::uniforms::MinifySamplerFilter::LinearMipmapLinear)
 			.wrap_function(gelatin::glium::uniforms::SamplerWrapFunction::Clamp);
 
-		let filter = match data.antialiasing {
-			Antialias::Auto if data.img_texel_size < AA_TEXEL_SIZE_THRESHOLD => {
-				MagnifySamplerFilter::Linear
-			}
-			Antialias::Auto | Antialias::Never => MagnifySamplerFilter::Nearest,
-			Antialias::Always => MagnifySamplerFilter::Linear,
-		};
-		let sampler = sampler.magnify_filter(filter);
+		let sampler =
+			sampler.magnify_filter(magnify_filter(data.antialiasing, data.img_texel_size));
 
 		// building the uniforms
 		let lod_level = lod_for_texel_size(data.img_texel_size);
@@ -1655,6 +1671,101 @@ fn draw_tex_grid(
 				&image_draw_params,
 			)
 			.unwrap_or_else(|error| log::error!("Could not draw the image: {error}"));
+	}
+}
+
+#[cfg(test)]
+mod promise_tests {
+	use super::*;
+
+	/// The image point (in texels from the image centre) drawn under `cursor` (window space).
+	fn texel_under(
+		cursor: LogicalVector,
+		widget_pos: LogicalVector,
+		img_pos: LogicalVector,
+		texel_size: f32,
+	) -> (f32, f32) {
+		let v = (cursor - widget_pos - img_pos).vec / texel_size;
+		(v.x, v.y)
+	}
+
+	/// Replays what the wheel handler does: the anchor is the cursor relative to the widget.
+	fn wheel(
+		cursor: LogicalVector,
+		widget_pos: LogicalVector,
+		img_pos: &mut LogicalVector,
+		texel_size: &mut f32,
+		wheel_delta: f32,
+	) {
+		let new_size = zoomed_texel_size(*texel_size, wheel_delta * 0.375);
+		*img_pos = zoomed_img_pos(*img_pos, cursor - widget_pos, new_size / *texel_size);
+		*texel_size = new_size;
+	}
+
+	#[test]
+	fn wheel_zoom_keeps_the_point_under_the_cursor_fixed() {
+		// A widget that is not at the window origin (e.g. below the macOS drag strip).
+		for widget_pos in [LogicalVector::new(0.0, 0.0), LogicalVector::new(120.0, 48.0)] {
+			let cursor = LogicalVector::new(400.0, 300.0);
+			let mut img_pos = LogicalVector::new(250.0, 180.0);
+			let mut texel_size = 0.8;
+			let before = texel_under(cursor, widget_pos, img_pos, texel_size);
+			for wheel_delta in [1.0, 2.0, 3.0, -1.0, -4.0, -5.0, 1.0, 1.0, 8.0] {
+				let old = texel_size;
+				wheel(cursor, widget_pos, &mut img_pos, &mut texel_size, wheel_delta);
+				assert_ne!(texel_size, old, "zoomed");
+				let after = texel_under(cursor, widget_pos, img_pos, texel_size);
+				assert!((after.0 - before.0).abs() < 1e-2, "{after:?} vs {before:?}");
+				assert!((after.1 - before.1).abs() < 1e-2, "{after:?} vs {before:?}");
+			}
+		}
+	}
+
+	#[test]
+	fn zooming_in_moves_the_image_away_from_the_cursor_and_out_towards_it() {
+		let anchor = LogicalVector::new(100.0, 100.0);
+		let img_pos = LogicalVector::new(300.0, 200.0);
+		let zoomed_in = zoomed_img_pos(img_pos, anchor, 2.0);
+		assert_eq!((zoomed_in.vec.x, zoomed_in.vec.y), (500.0, 300.0));
+		let zoomed_out = zoomed_img_pos(img_pos, anchor, 0.5);
+		assert_eq!((zoomed_out.vec.x, zoomed_out.vec.y), (200.0, 150.0));
+		// Zooming about the image centre doesn't move it.
+		let same = zoomed_img_pos(img_pos, img_pos, 3.0);
+		assert_eq!((same.vec.x, same.vec.y), (300.0, 200.0));
+	}
+
+	#[test]
+	fn zoom_snaps_to_one_to_one_and_respects_limits() {
+		assert_eq!(zoomed_texel_size(0.995, 0.0), 1.0);
+		assert_eq!(zoomed_texel_size(MAX_ZOOM_FACTOR, 5.0), MAX_ZOOM_FACTOR);
+		assert_eq!(zoomed_texel_size(MIN_ZOOM_FACTOR, -5.0), MIN_ZOOM_FACTOR);
+		assert!(zoomed_texel_size(1.0, 0.5) > 1.0 && zoomed_texel_size(1.0, -0.5) < 1.0);
+	}
+
+	#[test]
+	fn auto_antialiasing_shows_real_pixels_from_the_threshold_on() {
+		let auto = |texel_size| magnify_filter(Antialias::Auto, texel_size);
+		assert_eq!(auto(AA_TEXEL_SIZE_THRESHOLD), MagnifySamplerFilter::Nearest);
+		assert_eq!(auto(4.0), MagnifySamplerFilter::Nearest);
+		assert_eq!(auto(32.0), MagnifySamplerFilter::Nearest);
+		assert_eq!(auto(3.99), MagnifySamplerFilter::Linear);
+		assert_eq!(auto(1.0), MagnifySamplerFilter::Linear);
+		assert_eq!(auto(0.25), MagnifySamplerFilter::Linear);
+		// The explicit modes ignore the scale.
+		assert_eq!(magnify_filter(Antialias::Never, 0.5), MagnifySamplerFilter::Nearest);
+		assert_eq!(magnify_filter(Antialias::Always, 64.0), MagnifySamplerFilter::Linear);
+	}
+
+	/// Magnified pixel art is sampled from the full-resolution level only: the mip level
+	/// can't blur it, and the zoom steps up to the nearest threshold never leave level 0.
+	#[test]
+	fn magnified_pixel_art_is_never_sampled_from_a_blurred_mip() {
+		let mut texel_size = 1.0_f32;
+		while texel_size <= MAX_ZOOM_FACTOR {
+			assert_eq!(lod_for_texel_size(texel_size), 0.0, "texel size {texel_size}");
+			texel_size *= 1.37;
+		}
+		assert!(lod_for_texel_size(0.99) > 0.0);
 	}
 }
 

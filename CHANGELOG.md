@@ -1,3 +1,11 @@
+## Unreleased
+
+### Fixed
+- Very large JPEGs open faster (100 MP: ~427 → ~400 ms): opaque formats skip the transparency
+  scan before upload, and large RGB images are converted to RGBA on all cores
+- Tests cover the cursor-anchored zoom (also for a widget away from the window corner) and the
+  pixel-art switch to real pixels from 4× zoom
+
 ## 14.0.1
 
 ### Fixed

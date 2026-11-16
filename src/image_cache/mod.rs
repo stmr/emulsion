@@ -195,6 +195,7 @@ pub struct AnimationFrameTexture {
 	pub svg: bool,
 }
 impl AnimationFrameTexture {
+	#[allow(clippy::too_many_arguments)]
 	pub fn from_image(
 		display: &gelatin::Display,
 		image: image::RgbaImage,
@@ -202,6 +203,7 @@ impl AnimationFrameTexture {
 		orientation: Orientation,
 		primaries: Primaries,
 		svg: bool,
+		opaque: bool,
 	) -> TextureResult<Self> {
 		let (w, h) = image.dimensions();
 		let img_bytes = image.into_raw();
@@ -224,7 +226,7 @@ impl AnimationFrameTexture {
 				let cell_w = (w - offset_x).min(max_size);
 				let cell_h = (h - offset_y).min(max_size);
 				let tex = texture_from_img_rect(
-					display, w, h, &img_bytes, offset_x, offset_y, cell_w, cell_h,
+					display, w, h, &img_bytes, offset_x, offset_y, cell_w, cell_h, opaque,
 				)?;
 				let item = TextureGridItem { tex, col, row };
 				tex_grid.push(item);
@@ -334,6 +336,7 @@ fn texture_from_img_rect(
 	offset_y: u32,
 	cell_w: u32,
 	cell_h: u32,
+	opaque: bool,
 ) -> TextureResult<SrgbTexture2d> {
 	debug_assert!(offset_x + cell_w <= img_w && offset_y + cell_h <= img_h);
 	let mut raw_image = if img_w == cell_w {
@@ -360,8 +363,9 @@ fn texture_from_img_rect(
 	};
 
 	// Straight alpha can't be filtered: transparent texels' RGB would bleed into the edges of
-	// every mip level. Opaque images (the common case) only pay for the scan.
-	if has_transparency(&raw_image.data) {
+	// every mip level. Opaque images (the common case) only pay for the scan, and formats
+	// without an alpha channel not even for that.
+	if !opaque && has_transparency(&raw_image.data) {
 		premultiply_srgb(raw_image.data.to_mut());
 	}
 
@@ -937,7 +941,15 @@ impl ImageCache {
 				}
 				Ok(None)
 			}
-			LoadResult::Frame { req_id, image, delay_nano, orientation, primaries, svg } => {
+			LoadResult::Frame {
+				req_id,
+				image,
+				delay_nano,
+				orientation,
+				primaries,
+				svg,
+				opaque,
+			} => {
 				if !self.pending_requests.contains(&req_id) {
 					return Ok(None);
 				}
@@ -949,6 +961,7 @@ impl ImageCache {
 						orientation,
 						primaries,
 						svg,
+						opaque,
 					)?;
 					if entry.replacing {
 						entry.replacing = false;
