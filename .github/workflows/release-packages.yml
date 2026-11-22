@@ -110,6 +110,23 @@ jobs:
         echo $content
         $Env:PATH = $content
 
+        # dav1d-sys 0.8.3 builds dav1d 1.5.0, which MSVC 14.52 rejects (error C7780 in
+        # include/compat/msvc/stdatomic.h, fixed in dav1d 1.5.5). Build 1.5.5 here and
+        # let system-deps find it through pkg-config instead.
+        $dav1dSrc = "$Env:RUNNER_TEMP\dav1d"
+        $dav1dPrefix = "$Env:RUNNER_TEMP\dav1d-install"
+        git clone --depth 1 -b 1.5.5 https://code.videolan.org/videolan/dav1d.git $dav1dSrc
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        meson setup -Ddefault_library=static -Denable_tools=false -Denable_tests=false --prefix $dav1dPrefix "$dav1dSrc\build" $dav1dSrc
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        # meson compile, not ninja: meson activates the MSVC environment it configured with.
+        meson compile -C "$dav1dSrc\build"
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        meson install -C "$dav1dSrc\build"
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        $Env:PKG_CONFIG_PATH = "$dav1dPrefix\lib\pkgconfig"
+        $Env:SYSTEM_DEPS_DAV1D_BUILD_INTERNAL = "never"
+
         cargo build --release --locked --features=networking,avif
 
     - name: Copy executable to distributable folder
