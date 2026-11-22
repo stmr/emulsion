@@ -1,4 +1,4 @@
-## Unreleased
+## 14.0.2
 
 ### Fixed
 - Very large JPEGs open faster (100 MP: ~427 → ~400 ms): opaque formats skip the transparency
